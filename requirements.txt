@@ -34,3 +34,6 @@ jaxlib[cpu]>=0.4.20
 # Jupyter
 ipykernel>=7.1.0
 ipywidgets>=8.1.8
+
+# Library management
+python-dotenv

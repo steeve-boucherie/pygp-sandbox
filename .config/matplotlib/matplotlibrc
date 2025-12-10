@@ -1,0 +1,33 @@
+#########################################################################
+# USER-DEFINED MATPLOTLIB CONFIGURATION FILE
+#########################################################################
+# This file contains user-specific matplotlib settings that are used as 
+# default for the plotting methods in this package.
+# Add/remove, or adjust settings in order to customize display.
+# 
+# The user can refer to, for more details on how to customize plots using
+# rsParams:
+# - https://matplotlib.org/stable/users/explain/customizing.html
+# 
+# Alternatively a complete list of the available settings can be found in
+# the "matplotlibrc" file located in the matplotlib data folder: 
+# <PYTHON_PATH>/Lib/site-packages/matplotlib/mpl-data
+# Where <PYTHON_PATH> is the path point toward the current python
+# environment.
+#
+#
+# IMPORTANT
+# For the option in this file to be set a matplotlib default, ensure that
+# the MATPLOTLIBRC is defined as environment variables with its values
+# point towards this file.
+# Refer to: https://pypi.org/project/python-dotenv/ for details on how to
+# set up environement variable for a specific library/module.
+#########################################################################
+
+axes.titlesize : 16
+axes.labelsize : 14
+lines.markersize : 10
+xtick.labelsize : 12
+ytick.labelsize : 12
+legend.fontsize : 10
+font.size : 10
