@@ -1,0 +1,36 @@
+# Core dependencies
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.3.3
+xarray>=2025.12.0
+
+# Machine learning generic
+scikit-learn>=1.7.2
+
+# Dask
+dask>=2025.11.0
+dask[distributed]
+
+# Plotting
+matplotlib>=3.7.0
+seaborn>=0.13.2
+
+# GPyTorch and dependencies
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+gpytorch>=1.11
+
+# GPJax and dependencies
+jax>=0.4.20
+jaxlib>=0.4.20
+gpjax>=0.8.0
+jaxtyping>=0.2.23
+optax>=0.1.7
+
+# Optional: for better performance on CPU
+# Uncomment if you want optimized CPU performance for JAX
+jaxlib[cpu]>=0.4.20
+
+# Jupyter
+ipykernel>=7.1.0
+ipywidgets>=8.1.8
