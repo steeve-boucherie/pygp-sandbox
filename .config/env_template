@@ -7,5 +7,5 @@ TEST_FOLDER=${BASE}/tests
 
 
 # MATPLOTLIB CFG
-CONFIG_FOLDER=${PROJECT_ROOT}/.config
+CONFIG_FOLDER=${BASE}/.config
 MATPLOTLIBRC=${CONFIG_FOLDER}/matplotlib/matplotlibrc
