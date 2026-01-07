@@ -1,4 +1,5 @@
 """Generate dummy dataset for testing models."""
+import abc
 import logging
 from typing import Tuple
 
@@ -6,12 +7,20 @@ import numpy as np
 
 from scipy import stats
 
+import torch
+from torch import Tensor
+
 
 # LOGGER
 logger = logging.getLogger(__name__)
 
 
 # UTILS
+def _rng(random_seed: int | None) -> np.random.RandomState:
+    """Get rng"""
+    return np.random.RandomState(random_seed)
+
+
 def homoscedastic_data(
     n_points: int = 1000,
     t_df: int = 3,
@@ -76,6 +85,114 @@ def homoscedastic_data(
     y = y_true + noise
 
     return x, y, y_true  # , sigma_x
+
+
+def heteroscedastic_data(
+    n_points: int = 1000,
+    t_df: int = 3,
+    t_loc: float = 0.0,
+    t_scale: float = 2.1,
+    m: float = 3.,
+    sigma: float = 0.1,
+    seed: int = 42
+) -> np.ndarray:
+    """
+    Generate synthetic heteroskedastic data.
+
+    Notes
+    -----
+    - Sample x from a Student's t-distribution.
+    - Use power low of cosine(x) for y true-values.
+    - Apply white noise - normally distributed (iid)
+
+    Parameters:
+    -----------
+    n_points : int
+        Number of data points
+    t_df : float
+        Degrees of freedom for Student's t distribution
+    t_loc : float
+        Location parameter (mean) for Student's t
+    t_scale : float
+        Scale parameter for Student's t
+    m: float
+        The power exponent to apply to the cosine of x.
+    sigma: float
+        The standard deviation of the white noise.
+    seed : int
+        Random seed for reproducibility
+    """
+    rng = np.random.RandomState(seed)
+
+    # Generate x from Student's t distribution
+    x = rng.uniform(-15, 15, n_points)
+
+    # True function: power cosine
+    y_true = np.power(np.cos(np.deg2rad(x)), m)
+
+    # Heteroskedastic noise: sigma depends on x
+    # sigma = 0.02 * (1 + np.log10(np.abs(x) + 1))
+    sigma = 0.001 * (1 + np.abs(x))
+
+    # Homoscedastic noise
+    noise = stats.norm.rvs(0, sigma, size=n_points, random_state=rng)
+
+    # Add heteroskedastic noise
+    y = y_true + noise
+
+    return x, y, y_true  # , sigma_x
+
+
+# ABSTRACT
+class SyntheticDataGeneratorInterface(abc.ABC):
+    """
+    Abstract class for implementing synthetic data generator \
+        with support for heteroscedastic noise.
+
+    Abstract Methods
+    ----------------
+    All inherting classes must implement the following method.
+    true_signal: [np.ndarray] -> np.ndarray
+        Given the feature(s), compute the signal's true values.
+    noise: [np.ndarray] -> np.ndarray
+        Given the feature(s), compute the observation noise \
+        expressed as standard deviation (Gaussian).
+    sample_x: [int] -> np.ndarray
+        Given the expect number of samples, sample the values of \
+        the feature.
+    training_data: [int] -> Tuple[np.ndarray, np.ndarray]
+        Given the expect number of samples, generate a pair of \
+        feature and observations for model training.
+    """
+
+    # Abstract method
+    @abc.abstractmethod
+    def true_signal(self, X: np.ndarray) -> np.ndarray:
+        """Given the feature(s), compute the signal's true values."""
+        raise NotImplementedError('This in abstract method.')
+
+    @abc.abstractmethod
+    def noise(self, X: np.ndarray) -> np.ndarray:
+        """Given the feature(s), compute the observation noise magnitude \
+            expressed as standard deviation (Gaussian)."""
+        raise NotImplementedError('This in abstract method.')
+
+    @abc.abstractmethod
+    def generate_noise(self, X: np.ndarray) -> np.ndarray:
+        """Given the feature data, generate the corresponding observation \
+            noise samples."""
+
+    @abc.abstractmethod
+    def sample_x(self, n_samples: int) -> np.ndarray:
+        """Given the expect number of samples, sample the values of \
+            the feature."""
+        raise NotImplementedError('This in abstract method.')
+
+    @abc.abstractmethod
+    def training_data(self, n_samples: int) -> Tuple[np.ndarray, np.ndarray]:
+        """Given the expect number of samples, generate a pair of \
+            feature and observations for model training."""
+        raise NotImplementedError('This in abstract method.')
 
 
 # CLASS
@@ -225,3 +342,177 @@ class NoisyPCGenerator():
         ws = ws_true + noise
 
         return ws, power, ws_true
+
+
+class PowerCosineHeteroscedastic(SyntheticDataGeneratorInterface):
+    """
+    Synthethic data generator for power cosine with heteroscedastic \
+        (linear) noise.
+
+    Noise
+    -----
+    Noise is computed as a linear function of the absolute value of \
+        the angle in DEGREES.
+
+    Attributes
+    ----------
+    cos_m: float
+        Value of the power exponent to apply to the cosinus values.
+    noise_slope: float
+        Value of the slope for noise level.
+    noise_intercept: float
+        Value of the intercept for noise level.
+    random_seed: RandomState
+    """
+
+    # Default number of samples
+    _NSAMP = 201
+
+    # Init
+    def __init__(
+        self,
+        cos_m: float = 3.,
+        noise_slope: float = 0.1,
+        noise_intercept: float = 0.05,
+        random_seed: int | None = 1977,
+    ):
+        """Init class object."""
+        self.cos_m = cos_m
+        self.noise_slope = noise_slope
+        self.noise_intercept = noise_intercept
+
+        # Randomness
+        self.rng = _rng(random_seed)
+
+    # Method
+    def true_signal(self, X: np.ndarray) -> np.ndarray:
+        """
+        Given the feature(s), compute the signal's true values.
+
+        Notes
+        -----
+        Expects inputs in DEGREES.
+        Expects normalized inputs. The feature values are scaled by a factor \
+            of 2pi and input to the cosine expression.
+
+        Parameters
+        ----------
+        X: np.ndarray
+            Input features values in DEGREES.
+
+        Returns
+        -------
+            np.ndarray
+        """
+        return np.pow(np.cos(np.deg2rad(X)), self.cos_m)
+
+    def noise(self, X: np.ndarray) -> np.ndarray:
+        """
+        Given the feature(s), compute the observation noise \
+            expressed as standard deviation (Gaussian).
+
+        Notes
+        -----
+        Expects inputs in DEGREES.
+
+        >>> noise = (a * |x| + b)**2
+
+        Parameters
+        ----------
+        X: np.ndarray
+            Input features values in DEGREES.
+
+        Returns
+        -------
+            np.ndarray
+        """
+        xn = X / np.abs(X).max()
+        return np.pow(self.noise_intercept + self.noise_slope * np.abs(xn)**3, 2)
+
+    def generate_noise(
+        self,
+        X: np.ndarray,
+        random_seed: int | None = None,
+    ) -> np.ndarray:
+        """
+        Given the feature data, generate the corresponding observation \
+            noise values.
+
+        Parameters
+        ----------
+        X: np.ndarray
+            Input features values in DEGREES.
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
+
+        Returns
+        -------
+            np.ndarray
+        """
+        rng = [self.rng, _rng(random_seed)][random_seed is not None]
+        sigma = self.noise(X)**.5
+        return stats.norm(0, sigma).rvs(X.shape[0], random_state=rng)
+
+    def sample_x(
+        self,
+        n_samples: int | None = None,
+        random_seed: int | None = None,
+    ) -> np.ndarray:
+        """
+        Given the expect number of samples, sample the values of \
+            the feature.
+
+        Parameters
+        ----------
+        n_samples: np.ndarray
+            Number of samples to be generated.
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
+
+        Returns
+        -------
+            np.ndarray
+        """
+        n_samples = [self._NSAMP, n_samples][n_samples is not None]
+        rng = [self.rng, _rng(random_seed)][random_seed is not None]
+        return rng.uniform(-15, 15, n_samples)
+
+    def training_data(
+        self,
+        n_samples: int | None = None,
+        to_torch: bool = True,
+        random_seed: int | None = None,
+    ) -> Tuple[np.ndarray | Tensor, np.ndarray | Tensor]:
+        """
+        Given the expect number of samples, generate a pair of \
+            features and observations for model training.
+
+        Parameters
+        ----------
+        n_samples: np.ndarray
+            Number of samples to be generated.
+        to_torch: bool
+            An option for whether to output the training data in torch \
+            format (tensor) directly. Use torch.float32 is set to True.
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
+
+        Returns
+        -------
+        x_train: np.ndarray | Tensor
+            Training features.
+        y_train: np.ndarray | Tensor
+            Training observations.
+        """
+        x_train = self.sample_x(n_samples, random_seed)
+        y_train = self.true_signal(x_train)
+        y_train += self.generate_noise(x_train)
+
+        if to_torch:
+            x_train = torch.tensor(x_train).to(torch.float32)
+            y_train = torch.tensor(y_train).to(torch.float32)
+
+        return x_train, y_train
