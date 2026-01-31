@@ -210,3 +210,6 @@ __marimo__/
 # Repo
 data/
 .sandbox/
+
+# PyCharm
+.idea/
