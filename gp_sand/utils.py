@@ -1,7 +1,7 @@
 """A bunch of utility stuff"""
 import logging
 import warnings
-from typing import Any, Literal, Mapping
+from typing import Any, List, Literal, Mapping
 
 import numpy as np
 
@@ -9,9 +9,92 @@ from pandas import DataFrame
 
 from sklearn.utils import resample
 
+import torch
+from torch import Tensor
+
 
 # LOGGER
 logger = logging.getLogger(__name__)
+
+
+# FORMATTING
+def to_list(x: Any | List[Any]) -> List[Any]:
+    """
+    Convert the input variable to a list.
+
+    Notes
+    -----
+    Without effect if x is already of list type.
+
+    Parameters
+    ----------
+    x: Any | List[Any]
+        Input variable
+    allowed: List[Any]
+        The list of allowed values.
+
+    Raises
+    ------
+        ValueError
+    """
+    return [[x], x][isinstance(x, list)]
+
+
+def is_allowed(val: Any, allowed: List[Any]) -> None:
+    """
+    Test if the input value is one of the allowed values, \
+        raise ValueError if otherwise.
+
+    Parameters
+    ----------
+    val: Any
+        The value to be tested.
+    allowed: List[Any]
+        The list of allowed values.
+
+    Raises
+    ------
+        ValueError
+    """
+    if val not in allowed:
+        msg = f'Invalid value "{val}", must be one of "{allowed}". ' \
+              'Please check your inputs.'
+        logger.error(msg)
+        raise ValueError(msg)
+
+
+def rename_index(
+    df: DataFrame,
+    name: str,
+    axis: Literal['index', 'columns'] = 'columns'
+) -> DataFrame:
+    """
+    Rename the index or columns of the input single-level indexed dataframe.
+
+    Parameters
+    ----------
+    df: DataFrame
+        Input dataframe.
+    name: str
+        New name of the index/column.
+    axis: 'index' | 'column'
+        Whether the index or columns should be renamed.
+
+    Returns
+    -------
+        DataFrame
+    """
+    # Check inputs
+    is_allowed(axis, ['index', 'columns'])
+
+    # Rename
+    if axis == 'index':
+        df.index = df.index.rename(name)
+
+    else:
+        df.columns = df.columns.rename(name)
+
+    return df
 
 
 # PREPROCESSING
@@ -72,7 +155,63 @@ def resample_df(
     return out
 
 
+def to_numpy(
+    x: np.ndarray | Tensor,
+) -> np.ndarray:
+    """Convert the input to numpy if not already"""
+    if isinstance(x, Tensor):
+        x = x.numpy()
+
+    return x
+
+
+def to_tensor(
+    x: np.ndarray | Tensor,
+    dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Convert the input to Tensor if not already"""
+    if isinstance(x, np.ndarray):
+        x = torch.tensor(x).to(dtype)
+
+    return x
+
+
+# TRAINING GPs
+def get_inductions_points(
+    x_feat: np.ndarray | Tensor,
+    n_points: int = 150,
+) -> Tensor:
+    """
+    Given the input features, compute the initial locations \
+        of the inductions points for sparse GP training.
+
+    Parameters
+    ----------
+    x_feat: np.ndarray | Tensor
+        Input array of features.
+    n_points: int
+        The number of induction points to generate for each variables
+
+    Returns
+    -------
+        Tensor
+    """
+    x_feat = to_numpy(x_feat)
+    ind_points = np.percentile(
+        x_feat,
+        np.linspace(0, 100, n_points),
+        axis=0
+    )
+
+    x_feat = np.atleast_2d(x_feat)
+    np.random.random((n_points, x_feat.shape[1]))
+
+    return torch.tensor(ind_points).to(torch.float32)
+
+
 # METRICS
+
+
 def compute_rmse(
     pred: np.ndarray,
     actual: np.ndarray,

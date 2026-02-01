@@ -196,7 +196,7 @@ class SyntheticDataGeneratorInterface(abc.ABC):
 
 
 # CLASS
-class NoisyPCGenerator():
+class NoisyPCGenerator(SyntheticDataGeneratorInterface):
     """
     Class to generate noisy power curve data.
 
@@ -214,11 +214,14 @@ class NoisyPCGenerator():
         Rotor diameter.
     rho: float
         Air density value. Default = 1.2 kg.m^-3
-    noise: float
+    cov: float
         Noise level (in fraction).
     seed: int
         Random seed number for reproducibility.
     """
+
+    # Default number of samples
+    _NSAMP = 201
 
     # Init
     def __init__(
@@ -229,7 +232,7 @@ class NoisyPCGenerator():
         rd: float = 100,
         power_rated: float = 2500,
         rho: float = 1.2,
-        noise: float = 0.1,
+        cov: float = 0.1,
         seed: int = 1977,
     ):
         """Instantiate class object."""
@@ -244,7 +247,7 @@ class NoisyPCGenerator():
         self.power_rated = power_rated
 
         # Noise info
-        self.noise = noise
+        self.cov = cov
 
         self.rng = np.random.RandomState(seed)
 
@@ -259,94 +262,157 @@ class NoisyPCGenerator():
         """Return the RV wind speed distribution"""
         return stats.weibull_min(self.weib_k, scale=self.weib_a)
 
-    # Utils
-    def _sample_ws(self, n_samp: int) -> np.ndarray:
+    # Methods
+    def true_signal(self, X: np.ndarray) -> np.ndarray:
         """
-        Sample wind speed from the underlying distribution.
+        Given the feature(s), compute the signal's true values.
 
         Parameters
         ----------
-        n_samp: int
-            Number of samples.
+        X: np.ndarray
+            Input features values (wind speed).
 
         Returns
         -------
             np.ndarray
         """
-        ws = self.ws_rvs.rvs(n_samp, random_state=self.rng)
-        ws.sort()
-        return ws
+        power_aero = .5 * self.cp * self.rho * self.swept_area * X**3
+        power_aero /= 1000
+        power_aero = np.where(
+            power_aero <= self.power_rated,
+            power_aero,
+            self.power_rated
+        )
+        return power_aero
 
-    def compute_power(self, ws: np.ndarray) -> np.ndarray:
+    def noise(self, X: np.ndarray) -> np.ndarray:
         """
-        Given the wind speed compute the corresponding turbine power.
+        Given the feature(s), compute the observation noise \
+            expressed as standard deviation (Gaussian).
+
+        Notes
+        -----
+        >>> std = cov * ws
+
+        Where cov is the noise level specified as class attribute.
 
         Parameters
         ----------
-        ws: np.ndarray
-            Array of wind speed values.
+        X: np.ndarray
+            Input features values (wind speed).
 
         Returns
         -------
             np.ndarray
         """
+        return self.cov * np.array(X)
 
-        power_aero = (.5 * self.cp * self.rho * self.swept_area * ws**3) / 1000
-
-        return np.where(power_aero <= self.power_rated, power_aero, self.power_rated)
-
-    def _sample_noise(self, ws: np.ndarray) -> np.ndarray:
+    def generate_noise(
+        self,
+        X: np.ndarray,
+        random_seed: int | None = None,
+    ) -> np.ndarray:
         """
-        Given the wind speed compute the corresponding noise.
+        Given the feature data, generate the corresponding observation \
+            noise values.
 
         Parameters
         ----------
-        ws: np.ndarray
-            Array of wind speed values.
+        X: np.ndarray
+            Input features values (wind speed).
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
 
         Returns
         -------
             np.ndarray
         """
-        ws = np.array(ws)
+        rng = [self.rng, _rng(random_seed)][random_seed is not None]
         eps = stats.norm.rvs(
             loc=0,
-            scale=self.noise * ws,
-            size=ws.shape,
-            random_state=self.rng
+            scale=self.noise(X),
+            size=X.shape,
+            random_state=rng
         )
         return eps
 
-    # Main
-    def generate(self, n_samp: int = 5000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def sample_x(
+        self,
+        n_samples: int | None = None,
+        random_seed: int | None = None,
+    ) -> np.ndarray:
         """
-        Given the number of samples, generate the noisy power curve data.
+        Given the expect number of samples, sample the values of \
+            the feature.
 
         Parameters
         ----------
-        n_samp: int
-            Number of samples.
+        n_samples: np.ndarray
+            Number of samples to be generated.
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
 
         Returns
         -------
-        ws: np.ndarray
-            Array of noisy wind speed data.
-        power: np.ndarray
-            Array of power data.
-        ws_true: np.ndarray
-            Array of true wind speed data.
+            np.ndarray
         """
-        ws_true = self._sample_ws(n_samp)
-        power = self.compute_power(ws_true)
-        noise = self._sample_noise(ws_true)
-        ws = ws_true + noise
+        n_samples = [self._NSAMP, n_samples][n_samples is not None]
+        rng = [self.rng, _rng(random_seed)][random_seed is not None]
 
-        return ws, power, ws_true
+        x = (
+            stats
+            .weibull_min(
+                self.weib_k,
+                scale=self.weib_a
+            )
+            .rvs(n_samples, random_state=rng)
+        )
+        return x
+
+    def training_data(
+        self,
+        n_samples: int | None = None,
+        to_torch: bool = True,
+        random_seed: int | None = None,
+    ) -> Tuple[np.ndarray | Tensor, np.ndarray | Tensor]:
+        """
+        Given the expect number of samples, generate a pair of \
+            features and observations for model training.
+
+        Parameters
+        ----------
+        n_samples: np.ndarray
+            Number of samples to be generated.
+        to_torch: bool
+            An option for whether to output the training data in torch \
+            format (tensor) directly. Use torch.float32 is set to True.
+        random_seed: int | None
+            (Optional) Random seed number for reproducibility \
+            use the class default if None is passed.
+
+        Returns
+        -------
+        x_train: np.ndarray | Tensor
+            Training features.
+        y_train: np.ndarray | Tensor
+            Training observations.
+        """
+        x_train = self.sample_x(n_samples, random_seed)
+        y_train = self.true_signal(x_train)
+        x_train += self.generate_noise(x_train)
+
+        if to_torch:
+            x_train = torch.tensor(x_train).to(torch.float32)
+            y_train = torch.tensor(y_train).to(torch.float32)
+
+        return x_train, y_train
 
 
 class PowerCosineHeteroscedastic(SyntheticDataGeneratorInterface):
     """
-    Synthethic data generator for power cosine with heteroscedastic \
+    Synthetic data generator for power cosine with heteroscedastic \
         (linear) noise.
 
     Noise
