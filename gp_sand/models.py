@@ -125,8 +125,8 @@ class BaseExactGP(ExactGP, GPInterface):
 
     def __init__(
         self,
-        train_x: np.ndarray | Tensor,
-        train_y: np.ndarray | Tensor,
+        train_x: np.ndarray | Tensor | None = None,
+        train_y: np.ndarray | Tensor | None = None,
         mean_module: Mean = ConstantMean(),
         covar_module: Kernel = ScaleKernel(MaternKernel(nu=2.5)),
         likelihood: _GaussianLikelihoodBase = GaussianLikelihood(),
@@ -327,8 +327,8 @@ class BaseSparseGP(ApproximateGP, GPInterface):
 
     def __init__(
         self,
-        train_x: np.ndarray | Tensor,
-        train_y: np.ndarray | Tensor,
+        train_x: np.ndarray | Tensor | None = None,
+        train_y: np.ndarray | Tensor | None = None,
         mean_module: Mean = ConstantMean(),
         covar_module: Kernel = ScaleKernel(MaternKernel(nu=2.5)),
         likelihood: _GaussianLikelihoodBase = GaussianLikelihood(),

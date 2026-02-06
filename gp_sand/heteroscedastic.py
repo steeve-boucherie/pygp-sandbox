@@ -88,4 +88,3 @@ class HeteroskedasticGP(ExactGP):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return MultivariateNormal(mean_x, covar_x)
-
