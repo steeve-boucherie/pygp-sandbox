@@ -1,14 +1,18 @@
 """Customized mean modules for GPs regression."""
 import logging
+from typing import Any, Mapping
 
 from gpytorch.means import Mean
 
+import numpy as np
+
 import torch
 from torch import nn, Tensor
+from torch.optim import Adam
 
 
 # PACKAGE IMPORT
-# Nothin'
+from gp_sand.utils import to_tensor
 
 
 # LOGGER
@@ -69,6 +73,119 @@ class HyperbolicTangentMean(Mean):
         power = self.scale * p_norm
         return power.squeeze()
 
+    # Fit/Predict
+    def fit(
+        self,
+        train_x: np.ndarray | Tensor,
+        train_y: np.ndarray | Tensor,
+        n_epochs: int = 250,
+        optim_kw: Mapping[str, Any] = {},
+        verbose: bool = True,
+    ) -> 'HyperbolicTangentMean':
+        """
+        Given the traning data and fitting option, fit the model.
+
+        Parameters
+        ----------
+        train_x: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training features.
+        train_y: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training targets
+        obj: 'elbo' | 'predictive'
+            A string defininf the objective function to use for training. \
+            It must be one of ['elbo', 'predictive].
+        n_epochs: int
+            Number of training epoch.
+        optim_kw: Mapping[str, Any]
+            A mapper of the form param_name -> param_value of optional \
+            settings for the optimizer.
+        verbose: bool
+            An option for whether to print taining status in logger.
+
+        Returns
+        -------
+            BaseExactGP
+        """
+        # Get defaults
+        def _get_defaults() -> Mapping[str, Any]:
+            """Get default settings"""
+            params = {'lr': .1}
+            return params
+
+        # Force input types
+        train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
+
+        # Set training mode
+        self.train()
+
+        # Setup optimizer
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Set the objective function
+        obj = nn.MSELoss()
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Start training loop
+        for n in range(n_epochs):
+            # Zero grad
+            optimizer.zero_grad()
+
+            # Call
+            pred = self(train_x)
+            loss = obj(pred, train_y)
+
+            # Backward and propr
+            loss.backward()
+            optimizer.step()
+
+            if n == 0 or (n + 1) % 25 == 0 and verbose:
+                logger.info(
+                    f'Iter {n + 1} of {n_epochs}: '
+                    f'Loss: {loss.item(): .3f}'
+                )
+
+        # # Display score on selected metrics
+        # display_scores(self.score(train_x, train_y))
+
+        return self
+
+    def predict(
+        self,
+        test_x: np.ndarray | Tensor,
+        return_ci: bool = True,
+    ) -> Tensor:
+        """
+        Given the test feautres, make preduction and return the posterior \
+            distribution alongside with confidence interval.
+
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input features.
+        return_ci: bool
+            An option for whether to return the confidence interval.
+
+        Returns
+        -------
+            MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]
+        """
+        # Force input types
+        test_x = to_tensor(test_x)
+
+        # Set to eval
+        self.eval()
+
+        with torch.no_grad():
+            pred = self(test_x)
+
+        return pred
+
 
 class LogisticMean(Mean):
     """
@@ -121,3 +238,116 @@ class LogisticMean(Mean):
         denom = 1 + torch.exp(-1 * self.shape * (x - self.loc))
         power = self.scale / denom
         return power.squeeze()
+
+    # Fit/Predict
+    def fit(
+        self,
+        train_x: np.ndarray | Tensor,
+        train_y: np.ndarray | Tensor,
+        n_epochs: int = 250,
+        optim_kw: Mapping[str, Any] = {},
+        verbose: bool = True,
+    ) -> 'LogisticMean':
+        """
+        Given the traning data and fitting option, fit the model.
+
+        Parameters
+        ----------
+        train_x: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training features.
+        train_y: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training targets
+        obj: 'elbo' | 'predictive'
+            A string defininf the objective function to use for training. \
+            It must be one of ['elbo', 'predictive].
+        n_epochs: int
+            Number of training epoch.
+        optim_kw: Mapping[str, Any]
+            A mapper of the form param_name -> param_value of optional \
+            settings for the optimizer.
+        verbose: bool
+            An option for whether to print taining status in logger.
+
+        Returns
+        -------
+            BaseExactGP
+        """
+        # Get defaults
+        def _get_defaults() -> Mapping[str, Any]:
+            """Get default settings"""
+            params = {'lr': .1}
+            return params
+
+        # Force input types
+        train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
+
+        # Set training mode
+        self.train()
+
+        # Setup optimizer
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Set the objective function
+        obj = nn.MSELoss()
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Start training loop
+        for n in range(n_epochs):
+            # Zero grad
+            optimizer.zero_grad()
+
+            # Call
+            pred = self(train_x)
+            loss = obj(pred, train_y)
+
+            # Backward and propr
+            loss.backward()
+            optimizer.step()
+
+            if n == 0 or (n + 1) % 25 == 0 and verbose:
+                logger.info(
+                    f'Iter {n + 1} of {n_epochs}: '
+                    f'Loss: {obj.item(): .3f}'
+                )
+
+        # # Display score on selected metrics
+        # display_scores(self.score(train_x, train_y))
+
+        return self
+
+    def predict(
+        self,
+        test_x: np.ndarray | Tensor,
+        return_ci: bool = True,
+    ) -> Tensor:
+        """
+        Given the test feautres, make preduction and return the posterior \
+            distribution alongside with confidence interval.
+
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input features.
+        return_ci: bool
+            An option for whether to return the confidence interval.
+
+        Returns
+        -------
+            MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]
+        """
+        # Force input types
+        test_x = to_tensor(test_x)
+
+        # Set to eval
+        self.eval()
+
+        with torch.no_grad():
+            pred = self(test_x)
+
+        return pred
