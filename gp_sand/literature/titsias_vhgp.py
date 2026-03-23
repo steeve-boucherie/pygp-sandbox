@@ -46,7 +46,7 @@ import pandas as pd
 
 import torch
 from torch import Tensor
-from torch.optimizer import Adam
+from torch.optim import Adam
 
 
 # PACKAGE IMPORTS
@@ -179,7 +179,7 @@ class VariationalHeteroscedasticGP(ExactGP, GPInterface):
         # These are the diagonal elements used to compute the \
         # mean and sigma of the variation function
         n = to_tensor(train_x).size(0)
-        self.log_lamba_var = torch.nn.Parameter(
+        self.log_lambda_var = torch.nn.Parameter(
             torch.zeros(n) - 2.0  # Small values
         )
 
@@ -190,7 +190,7 @@ class VariationalHeteroscedasticGP(ExactGP, GPInterface):
     @property
     def lambda_var(self) -> torch.nn.Parameter:
         """Return the diagonal matrix Lambda."""
-        return torch.diag(torch.exp(self.log_lamba_var))
+        return torch.diag(torch.exp(self.log_lambda_var))
 
     # Utils
     def compute_variational_params(self) -> Tuple[Tensor, Tensor]:
@@ -211,7 +211,7 @@ class VariationalHeteroscedasticGP(ExactGP, GPInterface):
         mu: Tensor
             Mean of the q(g)
         sigma: Tensor
-            Covariance matri of q(g)
+            Covariance matrix of q(g)
         """
         # Get noise-GP pred
         mu_g = self.mean_noise(self.train_inputs[0])
@@ -531,7 +531,7 @@ class VariationalHeteroscedasticGP(ExactGP, GPInterface):
                 {'params': self.covar_latent.parameters()},
                 {'params': self.mean_noise.parameters()},
                 {'params': self.covar_noise.parameters()},
-                {'params': [self.log_lamba_var]},
+                {'params': [self.log_lambda_var]},
             ],
             **(_get_defaults() | optim_kw)
         )
