@@ -1,16 +1,15 @@
 """Mixture of Expert GP"""
 import logging
+import sys
 from copy import deepcopy
-from typing import Any, List, Mapping, Tuple
-
-from gp_sand.utils import to_tensor
+from typing import Any, Callable, List, Mapping, Tuple
 
 from gpytorch.constraints import Interval, Positive
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import Kernel
 from gpytorch.likelihoods import _GaussianLikelihoodBase
 from gpytorch.means import Mean
-from gpytorch.mlls import MarginalLogLikelihood, SumMarginalLogLikelihood
+from gpytorch.mlls import MarginalLogLikelihood
 from gpytorch.models import ApproximateGP, GP
 from gpytorch.variational import (
     CholeskyVariationalDistribution,
@@ -19,10 +18,18 @@ from gpytorch.variational import (
 
 import numpy as np
 
+import pandas as pd
+
 import torch
 from torch import Tensor
 from torch.distributions import Normal, MixtureSameFamily, Categorical
 from torch.optim import Adam
+
+
+# PACKAGE IMPORTS
+from gp_sand.metrics import compute_scores, display_scores
+from gp_sand.models import GPInterface, SCORES
+from gp_sand.utils import to_numpy, to_tensor
 
 
 # LOGGER
@@ -44,7 +51,7 @@ def _make_list(elem: Any, n_elems: int) -> List[Any]:
     """
     if isinstance(elem, list):
         return elem
-    
+
     return [deepcopy(elem) for _ in range(n_elems)]
 
 
@@ -70,30 +77,11 @@ def _verify_length(elements: List[Any], req_length: int) -> None:
         raise ValueError(msg)
 
 
-def _add_diag(cov: Tensor, jitter: float = 1e-4) -> Tensor:
-    """
-    Given the input covariance matrix, add jitter to the diagonal.
-
-    Parameters
-    ----------
-    cov: Tensor
-        Input covariance matrix.
-    jitter: float
-        Magnitude of the jitter to be added.
-
-    Returns
-    -------
-        Tensor
-    """
-    eye = torch.eye(cov.size(0), device=cov.device, dtype=cov.dtype)
-    return cov + jitter * eye
-
-
 # HELPER CLASS
 class ExpertSVGP(ApproximateGP):
     """GP model for the individual expert to be \
         used in the Mixture of Experts."""
-    
+
     # Init
     def __init__(
         self,
@@ -103,7 +91,7 @@ class ExpertSVGP(ApproximateGP):
     ):
         """Init class"""
         ind_points = to_tensor(ind_points)
-        var_dist= CholeskyVariationalDistribution(
+        var_dist = CholeskyVariationalDistribution(
             num_inducing_points=ind_points.size(0)
         )
         var_strat = VariationalStrategy(
@@ -161,7 +149,7 @@ class MoEVariationalELBO(MarginalLogLikelihood):
         self,
         likelihoods: List[_GaussianLikelihoodBase],
         model: 'MixtureofExpertSVGP',
-        num_data: int, 
+        num_data: int,
         beta: float = 1.0,
     ):
         # Register with the first likelihood as the "main" one
@@ -210,15 +198,17 @@ class MoEVariationalELBO(MarginalLogLikelihood):
             dim=0
         )  # (K, N) — already includes per-expert noise
 
-        mix  = Categorical(probs=weights.t())             # (N, K)
+        # TODO: Allow for mini-batching
+        mix = Categorical(probs=weights.t())             # (N, K)
         comp = Normal(means.t(), variances.sqrt().t())        # (N, K)
-        gmm  = MixtureSameFamily(mix, comp)
+        gmm = MixtureSameFamily(mix, comp)
         log_lik = gmm.log_prob(targets).sum() / outputs[0].event_shape[0]     # scalar
 
         # Get the KL divergence to force the variational distribution
         # toward the real one.
         # Scale by num_data/batch_size to match GPyTorch convention
-        batch_size = targets.shape[0]
+        # TODO: Allow for mini-batching
+        # batch_size = targets.shape[0]
         kl_scale = self.beta / self.num_data
 
         kl = sum(
@@ -231,11 +221,12 @@ class MoEVariationalELBO(MarginalLogLikelihood):
 
         return elbo
 
+
 # MAIN CLASS
-class MixtureofExpertSVGP(GP):
+class MixtureofExpertSVGP(GP, GPInterface):
     """Mixture of Expert combining prediction from individual SVGP \
         and a simple gating mechanism."""
-    
+
     # Init
     def __init__(
         self,
@@ -255,19 +246,19 @@ class MixtureofExpertSVGP(GP):
         ind_points = _make_list(ind_points, n_experts)
         ind_points = [to_tensor(_ind) for _ind in ind_points]
         _verify_length(ind_points, n_experts)
-        
+
         # Validate the mean models
         means = _make_list(means, n_experts)
         _verify_length(means, n_experts)
-        
+
         # Validate the covar models
         covars = _make_list(covars, n_experts)
         _verify_length(covars, n_experts)
-        
+
         # Validate the covar models
         likelihoods = _make_list(likelihoods, n_experts)
         _verify_length(likelihoods, n_experts)
-        
+
         # Set up the experts and likelihoods
         self.experts: List[ExpertSVGP] = [
             ExpertSVGP(
@@ -306,10 +297,15 @@ class MixtureofExpertSVGP(GP):
 
     # Properties
     @property
+    def name(self) -> str:
+        """Return the class name."""
+        return self.__class__.__name__
+
+    @property
     def n_transition_pts(self) -> int:
         """Return the number of transition points."""
         return self.n_experts - 1
-    
+
     @property
     def means(self) -> List[Mean]:
         """Return the list of mean models."""
@@ -319,7 +315,7 @@ class MixtureofExpertSVGP(GP):
     def covars(self) -> List[Mean]:
         """Return the list of mean models."""
         return [model.covar_module for model in self.experts]
-    
+
     @property
     def sharpness(self) -> Tensor:
         """Return the constrained sharpness"""
@@ -341,13 +337,13 @@ class MixtureofExpertSVGP(GP):
             cons_name = f'{name}_constraint'
             if hasattr(self, cons_name):
                 x_t = self.__getattr__(cons_name).transform(x_t)
-            
+
             transition_points.append(x_t)
 
         return transition_points
 
     # Util
-    def get_gates(self, x: Tensor) -> List[Tensor]:
+    def get_gates(self, x: Tensor) -> Tensor:
         """Given the inputs compute the gate values."""
         if x.ndim == 2 and x.size(1) == 1:
             x = x.squeeze()
@@ -385,8 +381,8 @@ class MixtureofExpertSVGP(GP):
         weights: Tensor
             The model weights estimated at each inputs.
         """
-        weights  = self.get_gates(x)          # (K, N)
-        latents  = self.forward(x)        # list of K MVN
+        weights = self.get_gates(x)          # (K, N)
+        latents = self.forward(x)        # list of K MVN
 
         obs_means = torch.stack(
             [lik.marginal(lat).mean
@@ -405,12 +401,12 @@ class MixtureofExpertSVGP(GP):
         ).sum(dim=0)
 
         return mixture_mean, expected_var + variance_of_means, weights
-    
+
     # Forward
     def forward(self, x: Tensor) -> MultivariateNormal:
         """Forward method."""
         return [model(x) for model in self.experts]
-    
+
     # Fit/Predict
     def fit(
         self,
@@ -448,6 +444,7 @@ class MixtureofExpertSVGP(GP):
             return params
 
         # Force input types
+        # TODO: Allow for mini-batching
         train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
 
         # Set training mode
@@ -487,15 +484,24 @@ class MixtureofExpertSVGP(GP):
             optimizer.step()
 
             if n == 0 or (n + 1) % 25 == 0 and verbose:
-                logger.info(
-                    f'Iter {n + 1} of {n_epochs}: '
-                    # f'Lenghscale: {}'
-                    # f'Noise: {self.likelihood.noise.item(): .3f} - '
+                msg = (
+                    f'{self.name} - Iter {n + 1} of {n_epochs}: '
                     f'Loss: {loss.item(): .3f}'
                 )
+                # weights = self.get_gates(train_x).mean(dim=1)
+                # msg += ' - '.join([
+                #     f' weight expert #{n:02d} = {round(weights[0].item(), 2)}'
+                #     for n in range(self.n_experts)
+                # ])
+                # msg += '\n'
+                # msg += ' - '.join([
+                #     f' noise expert #{n:02d} = {lkh.noise.item():.3e}'
+                #     for n, lkh in enumerate(self.likelihoods)
+                # ])
+                logger.info(msg)
 
-        # # Display score on selected metrics
-        # display_scores(self.score(train_x, train_y))
+        # Display score on selected metrics
+        display_scores(self.score(train_x, train_y))
 
         return self
 
@@ -503,6 +509,7 @@ class MixtureofExpertSVGP(GP):
         self,
         test_x: np.ndarray | Tensor,
         return_ci: bool = True,
+        ci_width: float = 1.96
     ) -> MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]:
         """
         Given the test feautres, make preduction and return the posterior \
@@ -514,6 +521,9 @@ class MixtureofExpertSVGP(GP):
             Input features.
         return_ci: bool
             An option for whether to return the confidence interval.
+        ci_width: float
+            The width of the confidence interval in multiple of the standard \
+            deviation at each point. Default is 1.96 (90% confidence interval).
 
         Returns
         -------
@@ -531,12 +541,141 @@ class MixtureofExpertSVGP(GP):
             mean, var, _ = self.mixture_distribution(test_x)
             std = var.sqrt()
 
-            lower = mean - 1.96 * std
-            upper = mean + 1.96 * std
+            lower = mean - ci_width * std
+            upper = mean + ci_width * std
 
         if return_ci:
             return mean, lower, upper
 
         return mean
 
+    def score(
+        self,
+        test_x: np.ndarray | Tensor,
+        test_y: np.ndarray | Tensor,
+        methods: (
+            Callable[[np.ndarray], float]
+            | List[Callable[[np.ndarray], float]]
+        ) = SCORES
+    ) -> pd.DataFrame:
+        """
+        Given the test features and targets, compute the corresponding \
+            predictions scores.
 
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input test features.
+        test_y: np.ndarray | Tensor
+            Input test targets.
+        methods: Callable | List[Callabe]
+            The socre methods to be used.
+
+        Returns
+        -------
+            DataFrame.
+        """
+        pred = to_numpy(self.predict(test_x, False).mean)
+        actual = to_numpy(test_y)
+        return compute_scores(pred, actual, methods)
+
+
+# CHILD
+class IterativeTrimmingMofEtSVGP(MixtureofExpertSVGP):
+    """
+    Implementation of the Mixture of Experts (MoE) using Sparse Variational \
+        Gaussian Processes (SVGP) with iterative trimming of the data to \
+        filter outliers.
+
+    Notes
+    -----
+    The class leverage all the methods of the MixtureofExpertSVGP. The only \
+    difference concerns the `fit` method that includes the outlier removal steps.
+
+    See: # TODO: Add reference
+    """
+
+    # Properties
+    @property
+    def name(self) -> str:
+        """Return the class name."""
+        return self.__class__.__name__
+
+    # Fit/Predict
+    def fit(
+        self,
+        train_x: np.ndarray | Tensor,
+        train_y: np.ndarray | Tensor,
+        n_iter: int = 5,
+        n_epochs: int = 100,
+        thresh_sd: float = 2.62,
+        thresh_max: float | None = None,
+        optim_kw: Mapping[str, Any] = {},
+        verbose: bool = True,
+    ) -> 'MixtureofExpertSVGP':
+        """
+        Given the traning data and fitting option, fit the model.
+
+        Parameters
+        ----------
+        train_x: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training features.
+        train_y: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training targets.
+        n_iter: int
+            The number of training iteration.
+        n_epochs: int
+            Number of training epoch for each iteration.
+        thresh_sd: float
+            The threshold for outlier detection in mulitple of the standard deviation.
+        thresh_max: float | None
+            (Optional) Max absolute threshold used for capping the standard deviation \
+            threshold in high-variance regions.
+        optim_kw: Mapping[str, Any]
+            A mapper of the form param_name -> param_value of optional \
+            settings for the optimizer.
+        verbose: bool
+            An option for whether to print taining status in logger.
+
+        Returns
+        -------
+            BaseExactGP
+        """
+        for n in range(n_iter):
+            logger.info(f'{self.name} - Start training iteration {n + 1} (of {n_iter}).')
+
+            # Run training of the MoE
+            logger.info(f'{self.name} - MoE training step.')
+            super().fit(
+                train_x,
+                train_y,
+                n_epochs=n_epochs,
+                optim_kw=optim_kw,
+                verbose=verbose,
+            )
+
+            # Run training of the MoE
+            logger.info(f'{self.name} - Outlier removal step.')
+            with torch.no_grad():
+                mean, var, _ = self.mixture_distribution(train_x)
+                upper = thresh_sd * var.sqrt()
+
+                # Apply thresholding
+                limit = [sys.maxsize, thresh_max][thresh_max is not None]
+                upper = torch.where(
+                    upper <= limit,
+                    upper,
+                    limit
+                )
+
+                res = train_y - mean
+                ind = res <= upper
+
+            logger.info(
+                f'{self.name} - Rejecting {-1 * (~ind.numpy().sum())} training samples '
+                f'({(100 * (1 - ind.numpy().mean())).round(2)}% of the data).'
+            )
+            train_x = train_x[ind, :]
+            train_y = train_y[ind]
+
+        return self
