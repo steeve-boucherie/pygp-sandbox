@@ -556,11 +556,11 @@ class PiecewiseLinearMean(Mean):
 
         # Piecewise mean
         mean = self.mu_1 \
-               + gate_1 * self.beta_2 * (x - self.x_12) \
-               - gate_0 * self.beta_0 * (x - self.x_01)
+            + gate_1 * self.beta_2 * (x - self.x_12) \
+            - gate_0 * self.beta_0 * (x - self.x_01)
 
         return mean
-    
+
     # Fit/Predict
     def fit(
         self,
