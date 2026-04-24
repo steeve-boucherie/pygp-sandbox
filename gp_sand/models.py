@@ -510,6 +510,42 @@ class BaseSparseGP(ApproximateGP, GPInterface):
 
         return self
 
+    def predict_latent(
+        self,
+        test_x: np.ndarray | Tensor,
+        return_ci: bool = True,
+    ) -> MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]:
+        """
+        Given the test feautres, make prediction of the latent function \
+            distribution and return with confidence interval.
+
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input features.
+        return_ci: bool
+            An option for whether to return the confidence interval.
+
+        Returns
+        -------
+            MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]
+        """
+        # Force input types
+        test_x = to_tensor(test_x)
+
+        # Set to eval
+        self.eval()
+        self.likelihood.eval()
+
+        with torch.no_grad():
+            f_dist = self(test_x)
+            lower, upper = f_dist.confidence_region()
+
+        if return_ci:
+            return f_dist, lower, upper
+
+        return f_dist
+
     def predict(
         self,
         test_x: np.ndarray | Tensor,
