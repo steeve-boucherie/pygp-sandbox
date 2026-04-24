@@ -1,4 +1,5 @@
 """Customized mean modules for GPs regression."""
+import abc
 import logging
 from typing import Any, Mapping
 
@@ -20,8 +21,47 @@ from gp_sand.utils import to_tensor
 logger = logging.getLogger(__name__)
 
 
+# ABSTRACT
+class MeanInterface(abc.ABC):
+    """
+    Interface class for Mean Module implementation.
+
+    Description
+    ------------
+    All inheriting class must implement the following methods:
+    - forward: [Tensor] -> Tensor
+        Given the input features, compute the mean values.
+    - fit: [Tensor, Tensor] -> self
+        Given the training data fit the model.
+    - predict: [Tensor] -> Tensor
+        Given the input features, return predictions.
+    """
+
+    @abc.abstractmethod
+    def forward(X: Tensor, *args, **kwargs) -> Tensor:
+        """Given the input features, compute the posterior distribution."""
+        raise NotImplementedError('This is an abstract class')
+
+    @abc.abstractmethod
+    def fit(X: Tensor, y: Tensor, *args, **kwargs) -> 'MeanInterface':
+        """Given the training data fit the model."""
+        raise NotImplementedError('This is an abstract class')
+
+    @abc.abstractmethod
+    def predict(X: Tensor, *args, **kwargs) -> Tensor:
+        """Given the input features, make prediction and return also the \
+            corresponding confidence region."""
+        raise NotImplementedError('This is an abstract class')
+
+    # @abc.abstractmethod
+    # def score(X: Tensor, y: Tensor, *args) -> pd.DataFrame:
+    #     """Given the test features and target compute the corresponding \
+    #         prediction scores."""
+    #     raise NotImplementedError('This is an abstract class')
+
+
 # CUSTOM MEAN MODULE
-class HyperbolicTangentMean(Mean):
+class HyperbolicTangentMean(Mean, MeanInterface):
     """
     Paramettric mean function to use in GP,
         approximating it as an hyperbolixc tangent.
@@ -188,7 +228,7 @@ class HyperbolicTangentMean(Mean):
         return pred
 
 
-class LogisticMean(Mean):
+class LogisticMean(Mean, MeanInterface):
     """
     Paramettric mean function to use in GP,
         approximating it as an logistic function.
@@ -354,7 +394,7 @@ class LogisticMean(Mean):
         return pred
 
 
-class PiecewiseLinearMean(Mean):
+class PiecewiseLinearMean(Mean, MeanInterface):
     """
     Smooth piecewise mean function for wind turbine pitch modelling.
 
