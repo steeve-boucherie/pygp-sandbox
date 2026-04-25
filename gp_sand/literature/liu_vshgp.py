@@ -1,5 +1,5 @@
 """
-Implemention of Spare Variational Heteroskedastic Gaussian Process \
+Implemention of Variational Sparse Heteroskedastic Gaussian Process \
     Liu et al. 2020.
 
 Description
