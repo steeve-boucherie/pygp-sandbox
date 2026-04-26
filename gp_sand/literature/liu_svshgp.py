@@ -21,13 +21,12 @@ arXiv:1811.01179v3
 TODO: Finish description.
 """
 import logging
-from typing import Any, Callable, List, Mapping, Tuple
+from typing import Any, Callable, List, Literal, Mapping, Tuple
 
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import Kernel, RBFKernel, ScaleKernel
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean, Mean, ZeroMean
-from gpytorch.mlls import AddedLossTerm
 from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.models import ApproximateGP
 from gpytorch.variational import (
@@ -45,6 +44,7 @@ import torch
 from torch import Tensor
 from torch.distributions import Normal
 from torch.optim import Adam
+from torch.utils.data import DataLoader, TensorDataset
 
 
 # PACKAGE IMPORTS
@@ -75,79 +75,220 @@ def default_kernel(d: int) -> Kernel:
     return ScaleKernel(RBFKernel(ard_num_dims=d))
 
 
-# ADDED LOSS TERMS
-# TODO: Remove
-class TraceGAddedLoss(AddedLossTerm):
-    """
-    Added loss term for the trace of the noise GP variance prediction in \
-        the SVSHGP formulation (Liu et al. 2020, Eq. 18).
-
-    >>> loss = 0.25 * trace(Sigma_g)
-
-    Where:
-    - Sigma_g is the covariance matrix of the noise-GP estimated on the \
-        the training data.
-
-    Attributes
-    ----------
-    sigma_g: Tensor
-        Posterior predictive for the variance of the latent GP.
-    """
-
-    def __init__(self, sigma_g: Tensor):
-        self.sigma_g = sigma_g
-
-    def loss(self, *args, **kwargs) -> Tensor:
-        """Compute the added loss term."""
-        loss = 0.25 * self.sigma_g
-        return loss.sum() / loss.size(0)
-
-
-# TODO: Remove
-class TraceFAddedLoss(AddedLossTerm):
-    """
-    Added loss term for the trace of the latent GP variance prediction in \
-        the SVSHGP formulation (Liu et al. 2020, Eq. 18).
-
-    >>> loss = 0.5 * (trace(Sigma_g) @ R_g^-1)
-
-    With:
-    >>> R_g = exp(mu_g - 0.5 * Sigma_g)
-
-    Where:
-    - Sigma_f is the covariance matrix of the latent-GP estimated on the \
-        the training data.
-    - mu_g is the mean vector matrix of the noise-GP estimated on the \
-        the training data.
-    - Sigma_g is the covariance matrix of the noise-GP estimated on the \
-        the training data.
-
-    Attributes
-    ----------
-    sigma_f: Tensor
-        Posterior predictive for the variance of the latent GP.
-    rg_diag: Tensor
-        Extra diagonal term from the noise-GP predictions.
-    """
-
-    def __init__(
-        self,
-        sigma_f: Tensor,
-        rg: Tensor,
-    ):
-        self.sigma_f = sigma_f
-        self.rg = rg
-
-    def loss(self, *args, **kwargs) -> Tensor:
-        """Compute the added loss term."""
-        loss = 0.5 * (self.sigma_f / self.rg)
-        return loss.sum() / loss.size(0)
-
-
 # NOISE GP
 class NoiseGP(ApproximateGP):
     """
-    Variational Sparse Gaussian Process for the observation Noise.
+    Variational Sparse Gaussian Process for modeling heteroskedastic observation noise.
+
+    This class implements the log-noise GP g(x) in the heteroskedastic GP framework, \
+    where the input-dependent noise variance is modeled as σ²(x) = exp(g(x)). The \
+    sparse approximation uses inducing points and variational inference to enable \
+    scalable training on large datasets.
+
+    Model Definition
+    ----------------
+    The log-noise function follows a Gaussian process prior:
+
+        g(x) ~ GP(μ₀, k_g(x, x'))
+
+    where:
+        μ₀      : Prior mean (learnable constant representing average log-noise level)
+        k_g     : Kernel function (e.g., RBF with ARD for capturing noise patterns)
+        σ²(x)   : exp(g(x)) is the heteroskedastic noise variance
+
+    Unlike the latent function f(x) which uses a zero-mean prior, g(x) requires a \
+    non-zero prior mean μ₀ to account for the baseline noise level, since we cannot \
+    assume the noise variance is centered at 1 (i.e., g(x) centered at 0).
+
+    Sparse Approximation
+    --------------------
+    To scale to large datasets, the full GP is approximated using u inducing points \
+    {X_u, g_u}:
+
+        p(g|g_u) = N(g | Ω_u(g_u - μ₀1) + μ₀1, K_gg - Q_gg)
+
+    where:
+        Ω_u = K_gu K_uu⁻¹           : Projection matrix
+        Q_gg = K_gu K_uu⁻¹ K_ug     : Low-rank approximation to K_gg
+        K_gg - Q_gg                 : Approximation error (trace penalty)
+
+    The inducing variables g_u are approximated by a variational distribution:
+
+        q(g_u) = N(g_u | μ_u, Σ_u)
+
+    with variational parameters {μ_u, Σ_u} and inducing locations X_u learned \
+    jointly during training.
+
+    Predictive Distribution
+    -----------------------
+    For a test point x*, the approximate posterior is:
+
+        q(g*) = ∫ p(g*|g_u) q(g_u) dg_u = N(g* | μ_g*, σ²_g*)
+
+    with:
+        μ_g* = k*u K_uu⁻¹ (μ_u - μ₀1) + μ₀
+        σ²_g* = k** - k*u K_uu⁻¹ k_u* + k*u K_uu⁻¹ Σ_u K_uu⁻¹ k_u*
+
+    The predicted noise variance at x* is then:
+
+        σ²(x*) = exp(μ_g* + 0.5 * σ²_g*)
+
+    This accounts for both the mean prediction and uncertainty in g.
+
+    Parameters
+    ----------
+    ind_points : Tensor, shape (u, d)
+        Inducing point locations for the sparse approximation. These are variational \
+        parameters that can be optimized during training when learn_inducing_locations=True.
+
+    mean_module : Mean
+        Prior mean function for g(x). Typically a ConstantMean() representing μ₀, \
+        which captures the average log-noise level across the input space.
+
+    covar_module : Kernel
+        Kernel (covariance) function for g(x). Defines the smoothness and structure \
+        of noise variations. Common choice: ScaleKernel(RBFKernel(ard_num_dims=d)).
+
+    jitter_val : float or None, default=None
+        Jitter value added to the diagonal of kernel matrices for numerical stability. \
+        Helps prevent issues with near-singular matrices during Cholesky decomposition. \
+        If None, uses GPyTorch's default jitter (typically 1e-6).
+
+    Attributes
+    ----------
+    mean_module : Mean
+        The prior mean function μ₀.
+
+    covar_module : Kernel
+        The kernel function k_g for modeling noise correlations.
+
+    variational_strategy : VariationalStrategy
+        Contains the inducing points X_u and variational distribution q(g_u). \
+        Handles the sparse GP approximation and KL divergence computation.
+
+    Methods
+    -------
+    forward(x)
+        Compute the approximate posterior q(g|x) for the log-noise at input x. \
+        Returns a MultivariateNormal distribution.
+
+    added_noise(x)
+        Compute the added noise covariance to be added to the latent function's \
+        posterior. Returns a diagonal operator with entries exp(μ_g + 0.5 * σ²_g).
+
+    Usage in SVSHGP
+    ---------------
+    The NoiseGP is used within SVSHGP to:
+
+    1. **During training**: Provide the noise variance R_g for computing the likelihood
+       term in the ELBO:
+
+           R_g = exp(μ_g - 0.5 * σ²_g)  # Effective noise for likelihood
+
+    2. **During prediction**: Add heteroskedastic uncertainty to the latent function's
+       prediction:
+
+           Var[y*] = Var[f*] + exp(μ_g* + 0.5 * σ²_g*)
+
+    The difference in the exponential terms arises from different contexts:
+    - Training uses R_g for the likelihood mean (Jensen's inequality correction)
+    - Prediction uses full noise variance including g's uncertainty
+
+    Examples
+    --------
+    >>> import torch
+    >>> from gpytorch.means import ConstantMean
+    >>> from gpytorch.kernels import ScaleKernel, RBFKernel
+
+    >>> # Create inducing points (e.g., via k-means or random subset)
+    >>> u, d = 30, 5
+    >>> inducing_points = torch.randn(u, d)
+
+    >>> # Initialize noise GP
+    >>> noise_gp = NoiseGP(
+    ...     ind_points=inducing_points,
+    ...     mean_module=ConstantMean(),
+    ...     covar_module=ScaleKernel(RBFKernel(ard_num_dims=d))
+    ... )
+
+    >>> # Forward pass: get posterior distribution at training points
+    >>> x_train = torch.randn(100, d)
+    >>> g_dist = noise_gp(x_train)
+    >>> print(f"Log-noise mean: {g_dist.mean.shape}")
+    >>> print(f"Log-noise variance: {g_dist.variance.shape}")
+
+    >>> # Get noise variance for prediction
+    >>> noise_gp.eval()
+    >>> with torch.no_grad():
+    ...     x_test = torch.randn(20, d)
+    ...     added_noise_cov = noise_gp.added_noise(x_test)
+    ...     noise_variance = added_noise_cov.diagonal()
+    >>> print(f"Predicted noise variance: {noise_variance[:5]}")
+
+    Notes
+    -----
+    - **Mean function**: Unlike f(x), the noise GP requires a non-zero mean μ₀ since \
+      noise variance σ² = exp(g) should not be assumed to equal 1 everywhere.
+
+    - **Inducing points**: The number of inducing points u controls the approximation \
+      quality. Fewer points than for f(x) may suffice since noise often varies more \
+      smoothly than the latent function. Typical: u ∈ [0.005n, 0.05n].
+
+    - **Kernel choice**: The kernel for g can differ from f's kernel. Noise patterns \
+      may have different length scales or smoothness properties than the latent function.
+
+    - **Independence assumption**: NoiseGP is trained independently from the latent GP \
+      (separate variational distribution q(g_u)), though both contribute to the joint ELBO.
+
+    - **Positivity constraint**: Using g = log(σ²) ensures positivity of noise variance \
+      without constrained optimization. The exponential transformation is applied in \
+      the likelihood computation and prediction.
+
+    - **Training vs. prediction**: Note the different exponential terms:
+      * Training: R_g = exp(μ_g - 0.5σ²_g) for stable likelihood evaluation
+      * Prediction: σ² = exp(μ_g + 0.5σ²_g) for full predictive uncertainty
+
+    - **Initialization**: The constant mean μ₀ should be initialized near log(σ²_empirical)
+      where σ²_empirical is the empirical variance of residuals from a preliminary fit.
+
+    Computational Complexity
+    ------------------------
+    - Forward pass: O(|B|u²) for a mini-batch of size |B|
+    - KL divergence: O(u³) computed once per iteration
+    - Total per iteration: O(|B|u² + u³)
+
+    This is much more efficient than exact GP's O(n³) complexity.
+
+    Mathematical Details
+    --------------------
+    The variational posterior q(g) marginalizes over the inducing variables:
+
+        q(g) = ∫ p(g|g_u) q(g_u) dg_u
+
+    This integral is analytically tractable for Gaussian distributions:
+
+        q(g) = N(g | μ_g, Σ_g)
+
+    where:
+        μ_g = Ω_u(μ_u - μ₀1) + μ₀1
+        Σ_g = K_gg - Q_gg + Ω_u Σ_u Ω_u^T
+
+    The KL divergence KL[q(g_u)||p(g_u)] provides regularization to prevent \
+    overfitting and is computed analytically using the Gaussian KL formula.
+
+    References
+    ----------
+    Liu, H., Ong, Y. S., & Cai, J. (2020). Large-scale Heteroscedastic Regression \
+    via Gaussian Process. arXiv preprint arXiv:1811.01179v3.
+
+    Titsias, M. (2009). Variational learning of inducing variables in sparse \
+    Gaussian processes. In AISTATS.
+
+    See Also
+    --------
+    SVSHGP : Main heteroskedastic GP model that uses NoiseGP
+    SVSHGPVariationalELBO : ELBO implementation for joint training
+    gpytorch.models.ApproximateGP : Base class for variational sparse GPs
     """
 
     def __init__(
@@ -192,27 +333,6 @@ class NoiseGP(ApproximateGP):
         return MultivariateNormal(mean, covar)
 
     # Utils
-    # TODO: Remove
-    def rg_diag(self, x: Tensor) -> Tensor:
-        """
-        Given the feature tensor, compute the added diagonal term, Rg, \
-            to used for model training during training.
-
-        Parameters
-        ----------
-        x: Tensor
-            The values of the training features to use for calling \
-            the noise GP (g).
-
-        Returns
-        -------
-            Tensor
-        """
-        g_dist = self(x)
-        rg = torch.exp(g_dist.mean - .5 * g_dist.variance)
-
-        return rg
-
     def added_noise(self, x: Tensor) -> DiagLinearOperator:
         """
         Given the feature tensor, compute the added noise to be added \
@@ -238,24 +358,194 @@ class NoiseGP(ApproximateGP):
 # MLL
 class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
     """
-    Variational ELBO marginal likelihood class for the Stochastic Variational \
-        Sparse Heteroskedastic GP.
+    Variational Evidence Lower Bound (ELBO) for Stochastic Variational Sparse \
+        Heteroskedastic Gaussian Process.
+
+    This class implements the factorized ELBO objective from Liu et al. (2020) \
+    that enables efficient stochastic variational inference for heteroskedastic \
+    GP regression with mini-batching support.
+
+    Objective Function
+    ------------------
+    The ELBO is factorized over training data points to enable mini-batch optimization:
+
+        F = Σᵢ₌₁ⁿ E_{q(fᵢ)q(gᵢ)}[log p(yᵢ|fᵢ, gᵢ)] \
+            - KL[q(f_m) || p(f_m)] \
+            - KL[q(g_u) || p(g_u)]
+
+    For a mini-batch B ⊂ {1, ..., n}, the unbiased stochastic estimate is:
+
+        F̃ = (n/|B|) Σᵢ∈B E_{q(fᵢ)q(gᵢ)}[log p(yᵢ|fᵢ, gᵢ)] \
+            - KL[q(f_m) || p(f_m)] \
+            - KL[q(g_u) || p(g_u)]
+
+    where |B| is the mini-batch size and n is the total training size.
+
+    Likelihood Term Decomposition
+    ------------------------------
+    The expected log-likelihood for each data point decomposes as:
+
+        E_{q(fᵢ)q(gᵢ)}[log p(yᵢ|fᵢ, gᵢ)] = L₁ᵢ - L₂ᵢ - L₃ᵢ
+
+    where:
+        L₁ᵢ = log N(yᵢ | μ_fᵢ, R_gᵢ)           # Main likelihood term
+        L₂ᵢ = 0.25 * σ²_gᵢ                    # Variance correction for g
+        L₃ᵢ = 0.5 * σ²_fᵢ / R_gᵢ              # Variance correction for f
+
+    with:
+        μ_fᵢ, σ²_fᵢ  : mean and variance of q(fᵢ) from the latent GP
+        μ_gᵢ, σ²_gᵢ  : mean and variance of q(gᵢ) from the noise GP
+        R_gᵢ = exp(μ_gᵢ - 0.5 * σ²_gᵢ)  : effective noise variance
+
+    The variance correction terms (L₂, L₃) arise from the variational \
+        approximation and ensure the ELBO is a valid lower bound.
+
+    KL Divergence Terms
+    -------------------
+    Two KL divergence terms regularize the variational distributions:
+
+        KL[q(f_m) || p(f_m)] : Regularizes the latent function inducing variables
+        KL[q(g_u) || p(g_u)] : Regularizes the noise function inducing variables
+
+    These terms prevent the variational distributions from deviating too far from \
+        their priors and are computed analytically for Gaussian distributions.
+
+    Normalization Convention (GPyTorch)
+    -----------------------------------
+    Following GPyTorch conventions, the implementation normalizes all terms:
+
+        F̃_norm = (1/|B|) Σᵢ∈B E[log p(yᵢ|fᵢ, gᵢ)] \
+                 - (1/n) KL[q(f_m) || p(f_m)] \
+                 - (1/n) KL[q(g_u) || p(g_u)]
+
+    This normalization:
+    - Improves numerical stability for large datasets
+    - Makes learning rates more transferable across dataset sizes
+    - Maintains gradient directions (since F̃_norm = F̃/n)
+
+    Parameters
+    ----------
+    model : SVSHGP
+        The SVSHGP model instance containing both the latent GP (f) and \
+        noise GP (g) with their variational strategies.
+    num_data : int
+        Total number of training data points (n). Used to properly scale \
+        the KL divergence terms relative to the mini-batch likelihood.
+    beta : float, default=1.0
+        KL divergence weighting factor. Values < 1 reduce KL penalty \
+        (increasing model flexibility), values > 1 increase regularization.
+        Typically kept at 1.0 for standard variational inference.
+    combine_terms : bool, default=True
+        If True, returns the complete ELBO as a single scalar.
+        If False, returns individual components (log_likelihood, kl_f, kl_g, log_prior) \
+        for debugging and analysis.
 
     Attributes
     ----------
-    num_data: int
-        The total number of training data points (used for normalization).
-    beta: float
-        A multiplicative factor for the KL divergence terms. Default is 1.
-    combine_terms: bool
-        Whether or not to sum the expected MLL with the KL terms. Default is True.
+    num_data : int
+        Total training dataset size.
+    beta : float
+        KL divergence scaling factor.
+    combine_terms : bool
+        Whether to combine ELBO terms into a single value.
+
+    Methods
+    -------
+    _log_likelihood_term(approximate_dist_f, targets, **kwargs)
+        Computes the expected log-likelihood term with variance corrections. \
+        Requires kwargs['x'] containing the input features for evaluating g(x).
+
+    forward(approximate_dist_f, targets, **kwargs)
+        Computes the complete ELBO (or its components if combine_terms=False). \
+        This is the main objective function maximized during training.
+
+    Mathematical Derivation
+    -----------------------
+    The likelihood term derivation starts from:
+
+        p(y|f, g) = N(y | f, exp(g))
+
+    Taking expectations under q(f)q(g):
+
+        E[log p(y|f, g)] = E[log N(y | f, exp(g))]
+                         = E[-0.5 * log(2π) - 0.5 * g - 0.5 * (y-f)²/exp(g)]
+
+    Applying the variational distributions q(f) = N(μ_f, σ²_f) and \
+    q(g) = N(μ_g, σ²_g), and using:
+
+        E[(y-f)²] = (y - μ_f)² + σ²_f
+        E[exp(-g)] = exp(-μ_g + 0.5 * σ²_g)
+
+    yields the three-term decomposition implemented in _log_likelihood_term.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from gpytorch.distributions import MultivariateNormal
+
+    >>> # Assume model is a trained SVSHGP instance
+    >>> mll = SVSHGPVariationalELBO(model, num_data=1000, beta=1.0)
+
+    >>> # During training with mini-batch
+    >>> batch_x = torch.randn(64, 5)  # Mini-batch of 64 samples
+    >>> batch_y = torch.randn(64)
+
+    >>> # Forward pass through model
+    >>> model.train()
+    >>> output_f = model(batch_x)
+
+    >>> # Compute ELBO (to be maximized, so we minimize its negative)
+    >>> loss = -mll(output_f, batch_y, x=batch_x)
+
+    >>> # For debugging, get individual components
+    >>> mll.combine_terms = False
+    >>> ll, kl_f, kl_g, prior = mll(output_f, batch_y, x=batch_x)
+    >>> print(f"Log-likelihood: {ll.item():.4f}")
+    >>> print(f"KL(q(f_m)||p(f_m)): {kl_f.item():.4f}")
+    >>> print(f"KL(q(g_u)||p(g_u)): {kl_g.item():.4f}")
+
+    Notes
+    -----
+    - The ELBO must be **maximized**, so use `loss = -mll(...)` for gradient descent.
+    - The `x=batch_x` keyword argument is **required** in the forward call to \
+      evaluate the noise GP g(x) for the current mini-batch.
+    - KL divergence terms are the same for all mini-batches (they don't depend on data), \
+      so they're computed once per iteration regardless of mini-batch size.
+    - For very large datasets, the KL terms become negligible relative to the \
+      likelihood, so the model is primarily data-driven.
+    - The variance correction terms (L₂, L₃) are crucial for capturing \
+      heteroskedasticity; removing them would degrade to homoskedastic GP.
+
+    Computational Complexity
+    ------------------------
+    Per mini-batch iteration:
+    - Likelihood term: O(|B|m² + |B|u²) for computing q(f) and q(g) on batch
+    - KL divergence: O(m³ + u³) for the two variational distributions (computed once)
+    - Total: O(|B|m² + |B|u² + m³ + u³)
+
+    This is much more efficient than the exact GP complexity O(n³) or the \
+    deterministic sparse variant O(nm² + nu²) when |B| << n.
+
+    References
+    ----------
+    Liu, H., Ong, Y. S., & Cai, J. (2020). Large-scale Heteroscedastic Regression \
+    via Gaussian Process. arXiv preprint arXiv:1811.01179v3.
+
+    Hensman, J., Fusi, N., & Lawrence, N. D. (2013). Gaussian processes for big data.
+    In Uncertainty in Artificial Intelligence (UAI).
+
+    See Also
+    --------
+    SVSHGP : The main model class that uses this ELBO
+    NoiseGP : Sparse GP for the noise variance function g(x)
+    gpytorch.mlls.VariationalELBO : Standard homoskedastic variational ELBO
     """
 
     def __init__(
         self,
         model: 'SVSHGP',
         num_data: int,
-        beta: float = 1,
+        beta: float = 1.,
         combine_terms: bool = True
     ):
         # NOTE: Use a dummy gaussian likelihood for super().__init__
@@ -265,9 +555,9 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
     def _log_likelihood_term(
         self,
         approximate_dist_f: MultivariateNormal,
-        target: Tensor,
+        targets: Tensor,
         **kwargs
-    ):
+    ) -> Tensor:
         """
         Compute the log likelihood term of the ELBO.
 
@@ -286,7 +576,7 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
         rg = torch.exp(g_dist.mean - 0.5 * g_dist.variance)
 
         # Term : main likelihood (residuals)
-        llk = Normal(approximate_dist_f.mean, rg.sqrt()).log_prob(target).sum()
+        llk = Normal(approximate_dist_f.mean, rg.sqrt()).log_prob(targets).sum()
 
         # Term 2: trace of G
         trace_g = 0.25 * g_dist.variance.sum()
@@ -299,7 +589,7 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
     def forward(
         self,
         approximate_dist_f: MultivariateNormal,
-        target: Tensor,
+        targets: Tensor,
         **kwargs: Mapping[str, Any]
     ) -> Tensor:
         """
@@ -328,24 +618,22 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
         # Get likelihood term and KL term
         num_batch = approximate_dist_f.event_shape[0]
         log_likelihood = (
-            self
-            ._log_likelihood_term(
+            self._log_likelihood_term(
                 approximate_dist_f,
-                target,
+                targets,
                 **kwargs
             )
             .div(num_batch)
         )
         kl_divergence = (
-            self
-            .model
+            self.model
             .variational_strategy
             .kl_divergence()
             .div(self.num_data / self.beta)
         )
 
-        # NOTE: This is addition of the KL term of the variational distrib of
-        # noise GP
+        # NOTE: This is the addition of the KL term of the
+        # variational distrib of noise GP
         kl_div_g = (
             self.model
             .noise_gp
@@ -378,29 +666,177 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 # STOCHASTIC VARIATIONAL SPARSE HETEROSKEDASTIC GAUSSIAN PROCESS
 class SVSHGP(ApproximateGP, GPInterface):
     """
-    Implemention of Stochastic Variational Sparse Heteroskedastic Gaussian Process \
-        Liu et al. 2020.
+    Stochastic Variational Sparse Heteroskedastic Gaussian Process (SVSHGP).
 
-    Description
-    -----------
-    TODO: Update - add mention that GP are sparse.
-    The model uses two GPs:
-    - f(x) ~ GP(0, K_f): latent function
-    - g(x) ~ GP(μ_0, K_g): log-noise process (noise variance = exp(g(x)))
+    This model implements the scalable heteroskedastic GP regression framework \
+    from Liu et al. (2020), which handles input-dependent noise variance through \
+    two independent sparse Gaussian processes with stochastic variational inference.
 
-    The variational distribution q(g) = N(g|μ, Σ) is parameterized by
-    a diagonal matrix Λ through:
-        μ = K_g(Λ - 0.5*I)1 + μ_0*1
-        Σ^{-1} = K_g^{-1} + Λ
+    Model Structure
+    ---------------
+    The heteroskedastic regression model is defined as:
 
-    Reference
-    ---------
-    arXiv:1811.01179v3
+        y(x) = f(x) + ε(x),  where ε(x) ~ N(0, σ²(x))
 
+    where both the latent function and noise variance are modeled as GPs:
+
+        f(x) ~ GP(0, k_f(x, x'))           # Latent function (zero mean)
+        g(x) ~ GP(μ₀, k_g(x, x'))          # Log-noise process
+        σ²(x) = exp(g(x))                  # Heteroskedastic noise variance
+
+    Sparse Approximation
+    --------------------
+    To enable scalability, the model uses sparse approximations for both GPs:
+
+    - **f(x)**: Approximated using m inducing points {X_m, f_m} with \
+      variational distribution q(f_m) = N(f_m | μ_m, Σ_m)
+
+    - **g(x)**: Approximated using u inducing points {X_u, g_u} with \
+      variational distribution q(g_u) = N(g_u | μ_u, Σ_u)
+
+    The inducing points and variational parameters are learned jointly during training.
+
+    Variational Inference
+    ---------------------
+    The model maximizes the Evidence Lower Bound (ELBO):
+
+        F = Σᵢ E_{q(fᵢ)q(gᵢ)}[log p(yᵢ|fᵢ, gᵢ)] \
+            - KL[q(f_m) || p(f_m)] \
+            - KL[q(g_u) || p(g_u)]
+
+    where the likelihood term decomposes as:
+
+        E[log p(yᵢ|fᵢ, gᵢ)] = log N(yᵢ | μ_fᵢ, R_gᵢ) \
+                              - 0.25 * σ²_gᵢ \
+                              - 0.5 * σ²_fᵢ / R_gᵢ
+
+    with:
+        μ_f, σ²_f : mean and variance of q(f)
+        μ_g, σ²_g : mean and variance of q(g)
+        R_g = exp(μ_g - 0.5 * σ²_g)
+
+    Stochastic Optimization
+    -----------------------
+    The factorized ELBO enables efficient stochastic variational inference using \
+    mini-batches, reducing time complexity from O(nm² + nu²) to O(|B|m² + |B|u² + m³ + u³) \
+    where |B| << n is the mini-batch size.
+
+    Parameters
+    ----------
+    ind_points_f : np.ndarray or Tensor, shape (m, d)
+        Inducing points for the latent function f. These are variational parameters \
+        that will be optimized during training (when learn_inducing_locations=True).
+
+    ind_points_g : np.ndarray or Tensor, shape (u, d)
+        Inducing points for the log-noise function g. Independent from ind_points_f \
+        to allow different resolutions for modeling mean and variance.
+
+    mean_f : Mean, default=ZeroMean()
+        Mean function for the latent GP f(x). Standard choice is zero-mean after \
+        data normalization.
+
+    covar_f : Kernel or None, default=None
+        Kernel function for the latent GP f(x). If None, uses ScaleKernel(RBFKernel) \
+        with ARD (automatic relevance determination).
+
+    mean_g : Mean, default=ConstantMean()
+        Mean function for the log-noise GP g(x). Uses a learnable constant μ₀ to \
+        account for the average noise level.
+
+    covar_g : Kernel or None, default=None
+        Kernel function for the log-noise GP g(x). If None, uses ScaleKernel(RBFKernel) \
+        with ARD. Can differ from covar_f to capture different length scales.
+
+    jitter_val : float or None, default=None
+        Jitter value added to diagonal of covariance matrices for numerical stability. \
+        If None, uses GPyTorch's default jitter.
 
     Attributes
     ----------
-    TODO: List class attributes
+    mean_module : Mean
+        Mean function for f(x).
+
+    covar_module : Kernel
+        Kernel function for f(x).
+
+    noise_gp : NoiseGP
+        Independent sparse GP for modeling log-noise variance g(x).
+
+    variational_strategy : VariationalStrategy
+        Variational strategy for the latent function f, containing inducing points
+        and variational distribution q(f_m).
+
+    Methods
+    -------
+    forward(x)
+        Compute the approximate posterior distribution q(f|x) for the latent function.
+
+    fit(train_x, train_y, n_epochs, batch_size, ...)
+        Train the model using stochastic variational inference with mini-batching.
+
+    predict(test_x, return_ci=True)
+        Make predictions at test points, including heteroskedastic noise uncertainty.
+
+    predict_latent(test_x, return_ci=True)
+        Predict only the latent function f(x) without noise.
+
+    score(test_x, test_y, methods)
+        Evaluate model performance on test data.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import numpy as np
+    >>> from gpytorch.kernels import ScaleKernel, RBFKernel
+
+    >>> # Generate synthetic heteroskedastic data
+    >>> n, d = 1000, 5
+    >>> X = np.random.randn(n, d)
+    >>> y = np.sin(X[:, 0]) + np.random.randn(n) * np.exp(0.5 * X[:, 1])
+
+    >>> # Initialize inducing points (e.g., via k-means or random subset)
+    >>> m, u = 50, 30
+    >>> ind_f = X[np.random.choice(n, m, replace=False)]
+    >>> ind_g = X[np.random.choice(n, u, replace=False)]
+
+    >>> # Create model
+    >>> model = SVSHGP(
+    ...     ind_points_f=ind_f,
+    ...     ind_points_g=ind_g,
+    ...     covar_f=ScaleKernel(RBFKernel(ard_num_dims=d)),
+    ...     covar_g=ScaleKernel(RBFKernel(ard_num_dims=d))
+    ... )
+
+    >>> # Train with mini-batching
+    >>> model.fit(X, y, n_epochs=100, batch_size=128, verbose=True)
+
+    >>> # Make predictions
+    >>> X_test = np.random.randn(100, d)
+    >>> pred_dist, lower, upper = model.predict(X_test)
+    >>> print(f"Predicted mean shape: {pred_dist.mean.shape}")
+    >>> print(f"Predicted variance (heteroskedastic): {pred_dist.variance[:5]}")
+
+    Notes
+    -----
+    - The model requires normalized data (zero mean, unit variance) for best performance.
+    - Inducing point initialization affects convergence; consider k-means clustering or
+      greedy variance reduction methods.
+    - The number of inducing points (m, u) controls the trade-off between accuracy and
+      computational cost. Typical choices: m, u ∈ [0.01n, 0.1n].
+    - Mini-batch size should be large enough to provide stable gradient estimates,
+      typically |B| ∈ [64, 512].
+    - Use different inducing point sets for f and g to allow independent resolution
+      control for mean and variance modeling.
+
+    References
+    ----------
+    Liu, H., Ong, Y. S., & Cai, J. (2020). Large-scale Heteroscedastic Regression \
+    via Gaussian Process. arXiv preprint arXiv:1811.01179v3.
+
+    See Also
+    --------
+    NoiseGP : Sparse GP for modeling log-noise variance g(x)
+    SVSHGPVariationalELBO : Custom ELBO implementation for joint training
     """
 
     def __init__(
@@ -447,28 +883,6 @@ class SVSHGP(ApproximateGP, GPInterface):
             jitter_val=jitter_val
         )
 
-        # Register added loss terms
-        # self.register_added_loss_term('trace_g')
-        # self.register_added_loss_term('trace_f')
-
-    # Utils
-    # def update_loss_terms(self, x: Tensor):
-    #     """Update the added loss terms."""
-    #     # sigma_g = self.noise_gp.covar_module(x)
-    #     self.update_added_loss_term(
-    #         'trace_g',
-    #         TraceGAddedLoss(
-    #             self.noise_gp(x).variance
-    #         )
-    #     )
-    #     self.update_added_loss_term(
-    #         'trace_f',
-    #         TraceFAddedLoss(
-    #             self(x).variance,
-    #             self.noise_gp.rg_diag(x),
-    #         )
-    #     )
-
     # Forward
     def forward(self, x: Tensor) -> MultivariateNormal:
         """
@@ -493,10 +907,12 @@ class SVSHGP(ApproximateGP, GPInterface):
         self,
         train_x: np.ndarray | Tensor,
         train_y: np.ndarray | Tensor,
-        n_epochs: int = 250,
+        n_epochs: int = 5,
+        batch_size: int = 64,
+        batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'NoiseGP':
+    ) -> 'SVSHGP':
         """
         Given the traning data and fitting option, fit the model.
 
@@ -505,12 +921,14 @@ class SVSHGP(ApproximateGP, GPInterface):
         train_x: np.ndarray | torch.Tensor, shape (n, m)
             Tensor of training features.
         train_y: np.ndarray | torch.Tensor, shape (n, m)
-            Tensor of training targets
-        obj: 'elbo' | 'predictive'
-            A string defininf the objective function to use for training. \
-            It must be one of ['elbo', 'predictive].
+            Tensor of training targets.
         n_epochs: int
-            Number of training epoch.
+            Number of training epochs.
+        batch_size: int
+            Batch size to split the training data in mini-batches.
+        batch_kw: Mapping[str, Any]
+            A mapper of th eofrm param_name -> param_value of optional \
+            settings to pass to the DataLoader for mini-batching.
         optim_kw: Mapping[str, Any]
             A mapper of the form param_name -> param_value of optional \
             settings for the optimizer.
@@ -519,12 +937,19 @@ class SVSHGP(ApproximateGP, GPInterface):
 
         Returns
         -------
-            BaseExactGP
+            SVSHGP
         """
         # Get defaults
-        def _get_defaults() -> Mapping[str, Any]:
+        def _get_defaults(obj: Literal['batch', 'optim']) -> Mapping[str, Any]:
             """Get default settings"""
-            params = {'lr': .1}
+            params = {
+                'batch': {
+                    'batch_size': batch_size,
+                    'shuffle': True,
+                    'drop_last': True
+                },
+                'optim': {'lr': .1}
+            }[obj]
             return params
 
         # Force input types
@@ -538,28 +963,35 @@ class SVSHGP(ApproximateGP, GPInterface):
         # Setup optimizer
         optimizer = Adam(
             self.parameters(),
-            **(_get_defaults() | optim_kw)
+            **(_get_defaults('optim') | optim_kw)
         )
 
         # Set the objective function
         mll = SVSHGPVariationalELBO(self, num_data=train_y.size(0))
 
+        # Create data loader for mini-batching
+        data_loader = DataLoader(
+            TensorDataset(train_x, train_y),
+            **(_get_defaults('batch') | batch_kw)
+        )
+
         # Start training loop
-        # FIXME: Make this compatible with mini-batching
         for n in range(n_epochs):
-            # Zero grad
-            optimizer.zero_grad()
+            for batch_x, batch_y in data_loader:
+                # Zero grad
+                optimizer.zero_grad()
 
-            # Call
-            pred = self(train_x)
-            # self.update_loss_terms(train_x)
-            loss = - mll(pred, train_y, x=train_x)
+                # Call
+                pred = self(batch_x)
+                # self.update_loss_terms(train_x)
+                loss = - mll(pred, batch_y, x=batch_x)
 
-            # Backward and propr
-            loss.backward()
-            optimizer.step()
+                # Backward and propr
+                loss.backward()
+                optimizer.step()
 
-            if n == 0 or (n + 1) % 25 == 0 and verbose:
+            # if n == 0 or (n + 1) % 25 == 0 and verbose:
+            if verbose:
                 logger.info(
                     f'Iter {n + 1} of {n_epochs}: '
                     # f'Lenghscale: {}'
