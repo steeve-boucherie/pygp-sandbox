@@ -2,7 +2,7 @@
 import logging
 import sys
 from copy import deepcopy
-from typing import Any, Callable, List, Mapping, Tuple
+from typing import Any, Callable, List, Literal, Mapping, Tuple
 
 from gpytorch.constraints import Interval, Positive
 from gpytorch.distributions import MultivariateNormal
@@ -10,6 +10,7 @@ from gpytorch.kernels import Kernel
 from gpytorch.likelihoods import _GaussianLikelihoodBase
 from gpytorch.means import Mean
 from gpytorch.mlls import MarginalLogLikelihood
+from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.models import ApproximateGP, GP, IndependentModelList
 from gpytorch.utils.generic import length_safe_zip
 from gpytorch.variational import (
@@ -25,6 +26,7 @@ import torch
 from torch import nn, Tensor
 from torch.distributions import Normal, MixtureSameFamily, Categorical
 from torch.optim import Adam
+from torch.utils.data import DataLoader, TensorDataset
 
 
 # PACKAGE IMPORTS
@@ -130,7 +132,7 @@ class ExpertSVGP(ApproximateGP):
         return MultivariateNormal(mean_f, covar_f)
 
 
-class MoEVariationalELBO(MarginalLogLikelihood):
+class MoEVariationalELBO(_ApproximateMarginalLogLikelihood):
     """
     Custom ELBO for a Mixture of SVGP Experts.
     Mirrors the structure of GPyTorch's VariationalELBO but handles
@@ -158,29 +160,29 @@ class MoEVariationalELBO(MarginalLogLikelihood):
     ):
         # Register with the first likelihood as the "main" one
         # for compatibility with GPyTorch's MLL interface
-        super().__init__(likelihoods[0], model)
+        super().__init__(likelihoods[0], model, num_data, beta, True)
         self.likelihoods = likelihoods
-        self.num_data = num_data
-        self.beta = beta
+        # self.num_data = num_data
+        # self.beta = beta
 
-    def forward(
+    def _log_likelihood_term(
         self,
         outputs: List[MultivariateNormal],
         targets: Tensor,
         **kwargs
     ) -> Tensor:
         """
-        Parameters
+        Compute the mixture's log-likelihood term of the ELBO.
+
+        Attributes
         ----------
         outputs : List[MultivariateNormal]
             The individual expert predictions
         targets : Tensor (N,)
             Observed values.
-
-        Returns
-        -------
-        ELBO: Tensor
-            The estimated ELBO
+        kwargs: Mapping[str, Any]
+            Optional argument it must constain the tensor of training features \
+            to estimate the mixture's weights.
         """
         # Get the gates
         weights = self.model.get_gates(kwargs['x'])  # (K, N)
@@ -202,26 +204,54 @@ class MoEVariationalELBO(MarginalLogLikelihood):
             dim=0
         )  # (K, N) — already includes per-expert noise
 
-        # TODO: Allow for mini-batching
         mix = Categorical(probs=weights.t())             # (N, K)
         comp = Normal(means.t(), variances.sqrt().t())        # (N, K)
         gmm = MixtureSameFamily(mix, comp)
-        log_lik = gmm.log_prob(targets).sum() / outputs[0].event_shape[0]     # scalar
+        log_lik = gmm.log_prob(targets).sum()  # scalar
+
+        return log_lik
+
+    def forward(
+        self,
+        outputs: List[MultivariateNormal],
+        targets: Tensor,
+        **kwargs
+    ) -> Tensor:
+        """
+        Parameters
+        ----------
+        outputs : List[MultivariateNormal]
+            The individual expert predictions
+        targets : Tensor (N,)
+            Observed values.
+
+        Returns
+        -------
+        ELBO: Tensor
+            The estimated ELBO
+        """
+        # Get the likelihood term
+        num_batch = outputs[0].event_shape[0]
+        log_likelihood = (
+            self._log_likelihood_term(
+                outputs,
+                targets,
+                **kwargs
+            )
+            .div(num_batch)
+        )
 
         # Get the KL divergence to force the variational distribution
         # toward the real one.
-        # Scale by num_data/batch_size to match GPyTorch convention
-        # TODO: Allow for mini-batching
-        # batch_size = targets.shape[0]
         kl_scale = self.beta / self.num_data
 
         kl = sum(
-            expert.variational_strategy.kl_divergence().sum()
+            expert.variational_strategy.kl_divergence()  # .sum()
             for expert in self.model.experts
         )
 
         # Assemble the ELBO term
-        elbo = log_lik - kl_scale * kl
+        elbo = log_likelihood - kl_scale * kl
 
         return elbo
 
@@ -483,7 +513,9 @@ class MixtureofExpertSVGP(GP, GPInterface):
         self,
         train_x: np.ndarray | Tensor,
         train_y: np.ndarray | Tensor,
-        n_epochs: int = 150,
+        n_epochs: int = 10,
+        batch_size: int = 256,
+        batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
     ) -> 'MixtureofExpertSVGP':
@@ -497,7 +529,12 @@ class MixtureofExpertSVGP(GP, GPInterface):
         train_y: np.ndarray | torch.Tensor, shape (n, m)
             Tensor of training targets
         n_epochs: int
-            Number of training epoch.
+            Number of training epochs.
+        batch_size: int
+            Batch size to split the training data in mini-batches.
+        batch_kw: Mapping[str, Any]
+            A mapper of th eofrm param_name -> param_value of optional \
+            settings to pass to the DataLoader for mini-batching.
         optim_kw: Mapping[str, Any]
             A mapper of the form param_name -> param_value of optional \
             settings for the optimizer.
@@ -509,58 +546,56 @@ class MixtureofExpertSVGP(GP, GPInterface):
             MixtureofExpertSVGP
         """
         # Get defaults
-        def _get_defaults() -> Mapping[str, Any]:
+        def _get_defaults(obj: Literal['batch', 'optim']) -> Mapping[str, Any]:
             """Get default settings"""
-            params = {'lr': .1}
+            params = {
+                'batch': {
+                    'batch_size': batch_size,
+                    'shuffle': True,
+                    'drop_last': True
+                },
+                'optim': {'lr': .1}
+            }[obj]
             return params
 
         # Force input types
-        # TODO: Allow for mini-batching
         train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
 
         # Set training mode
         self.train()
         self.likelihood.train()
-        # TODO: Remove the commented code
-        # [model.train() for model in self.experts]
-        # [likelihood.train() for likelihood in self.likelihood]
-
-        # Setup optimizer
-        # all_params = [
-        #     {'params': self.parameters()},
-        # ]
-        # for expert, llk in zip(self.experts, self.likelihood):
-        #     all_params += [
-        #         {'params': expert.parameters()},
-        #         {'params': llk.parameters()}
-        #     ]
 
         optimizer = Adam(
-            # all_params,
-            [
-                {'params': self.parameters()},
-                # {'params': self.likelihood.parameters()}
-            ],
-            **(_get_defaults() | optim_kw)
+            self.parameters(),
+            **(_get_defaults('optim') | optim_kw)
         )
 
         # Set the objective function
         mll = MoEVariationalELBO(self.likelihood, self, num_data=train_y.size(0))
 
+        # Create data loader for mini-batching
+        data_loader = DataLoader(
+            TensorDataset(train_x, train_y),
+            **(_get_defaults('batch') | batch_kw)
+        )
+
         # Start training loop
         for n in range(n_epochs):
-            # Zero grad
-            optimizer.zero_grad()
+            for batch_x, batch_y in data_loader:
+                # Zero grad
+                optimizer.zero_grad()
 
-            # Call
-            predictions = self(train_x)
-            loss = -mll(predictions, train_y, x=train_x)
+                # Call
+                pred = self(batch_x)
+                # self.update_loss_terms(train_x)
+                loss = - mll(pred, batch_y, x=batch_x)
 
-            # Backward and propr
-            loss.backward()
-            optimizer.step()
+                # Backward and propr
+                loss.backward()
+                optimizer.step()
 
-            if n == 0 or (n + 1) % 25 == 0 and verbose:
+            # if n == 0 or (n + 1) % 25 == 0 and verbose:
+            if verbose:
                 msg = (
                     f'{self.name} - Iter {n + 1} of {n_epochs}: '
                     f'Loss: {loss.item(): .3f}'
