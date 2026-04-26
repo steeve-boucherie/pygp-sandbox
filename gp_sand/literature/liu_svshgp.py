@@ -76,6 +76,7 @@ def default_kernel(d: int) -> Kernel:
 
 
 # ADDED LOSS TERMS
+# TODO: Remove
 class TraceGAddedLoss(AddedLossTerm):
     """
     Added loss term for the trace of the noise GP variance prediction in \
@@ -102,6 +103,7 @@ class TraceGAddedLoss(AddedLossTerm):
         return loss.sum() / loss.size(0)
 
 
+# TODO: Remove
 class TraceFAddedLoss(AddedLossTerm):
     """
     Added loss term for the trace of the latent GP variance prediction in \
@@ -190,6 +192,7 @@ class NoiseGP(ApproximateGP):
         return MultivariateNormal(mean, covar)
 
     # Utils
+    # TODO: Remove
     def rg_diag(self, x: Tensor) -> Tensor:
         """
         Given the feature tensor, compute the added diagonal term, Rg, \
@@ -292,6 +295,84 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
         trace_f = 0.5 * (approximate_dist_f.variance / rg).sum()
 
         return llk - trace_g - trace_f
+
+    def forward(
+        self,
+        approximate_dist_f: MultivariateNormal,
+        target: Tensor,
+        **kwargs: Mapping[str, Any]
+    ) -> Tensor:
+        """
+        Given the approximate distributions and training targets, compute the variational ELBO\
+            including the KL divergence terms for both the latent and the noise GP.
+
+        Notes
+        -----
+        This is a copy/past of the `foward` method of the `_ApproximateMarginalLogLikelihood` \
+            whit the addition of the KL divergence term for the noise GP variational \
+            distribution.
+
+        Parameters
+        ----------
+        approximate_dist_f: MultivariateNormal
+            Estimate latent function.
+        target: Tensor
+            Training targets.
+        **kwargs: Mapping[str, Any]
+            Optional argument to pass to the _log_likelihood_term function
+
+        Returns
+        -------
+            Tensor
+        """
+        # Get likelihood term and KL term
+        num_batch = approximate_dist_f.event_shape[0]
+        log_likelihood = (
+            self
+            ._log_likelihood_term(
+                approximate_dist_f,
+                target,
+                **kwargs
+            )
+            .div(num_batch)
+        )
+        kl_divergence = (
+            self
+            .model
+            .variational_strategy
+            .kl_divergence()
+            .div(self.num_data / self.beta)
+        )
+
+        # NOTE: This is addition of the KL term of the variational distrib of
+        # noise GP
+        kl_div_g = (
+            self.model
+            .noise_gp
+            .variational_strategy
+            .kl_divergence()
+            .div(self.num_data / self.beta)
+        )
+
+        # Add any additional registered loss terms
+        added_loss = torch.zeros_like(log_likelihood)
+        had_added_losses = False
+        for added_loss_term in self.model.added_loss_terms():
+            added_loss.add_(added_loss_term.loss())
+            had_added_losses = True
+
+        # Log prior term
+        log_prior = torch.zeros_like(log_likelihood)
+        for name, module, prior, closure, _ in self.named_priors():
+            log_prior.add_(prior.log_prob(closure(module)).sum().div(self.num_data))
+
+        if self.combine_terms:
+            return log_likelihood - kl_divergence - kl_div_g + log_prior - added_loss
+        else:
+            if had_added_losses:
+                return log_likelihood, kl_divergence, kl_div_g, log_prior, added_loss
+            else:
+                return log_likelihood, kl_divergence, kl_div_g, log_prior
 
 
 # STOCHASTIC VARIATIONAL SPARSE HETEROSKEDASTIC GAUSSIAN PROCESS
