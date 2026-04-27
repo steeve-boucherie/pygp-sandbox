@@ -84,7 +84,7 @@ def _verify_length(elements: List[Any], req_length: int) -> None:
 
 
 # HELPER CLASS
-class ExpertSVGP(ApproximateGP):
+class ExpertVSGP(ApproximateGP):
     """GP model for the individual expert to be \
         used in the Mixture of Experts."""
 
@@ -142,7 +142,7 @@ class MoEVariationalELBO(_ApproximateMarginalLogLikelihood):
     ----------
     likelihoods : list of GaussianLikelihood
         One per expert.
-    model : MoSVGP
+    model : MoEVSGP
         The mixture model exposing .experts and .gates(x).
     num_data : int
         Total training set size (for correct KL scaling).
@@ -154,7 +154,7 @@ class MoEVariationalELBO(_ApproximateMarginalLogLikelihood):
     def __init__(
         self,
         likelihoods: List[_GaussianLikelihoodBase],
-        model: 'MixtureofExpertSVGP',
+        model: 'MixtureofExpertVSGP',
         num_data: int,
         beta: float = 1.0,
     ):
@@ -271,7 +271,7 @@ class SumMoEVariationalELBO(MarginalLogLikelihood):
     def __init__(
         self,
         likelihood: _GaussianLikelihoodBase,  # There for compatibility not used
-        model: 'MoESVGPList',
+        model: 'MoEVSGPList',
         num_data: List[int],
         beta: float | List[float] = 1.0,
     ):
@@ -324,8 +324,8 @@ class SumMoEVariationalELBO(MarginalLogLikelihood):
 
 
 # MAIN CLASS
-class MixtureofExpertSVGP(GP, GPInterface):
-    """Mixture of Expert combining prediction from individual SVGP \
+class MixtureofExpertVSGP(GP, GPInterface):
+    """Mixture of Expert combining prediction from individual VSGP \
         and a simple gating mechanism."""
 
     # Init
@@ -362,7 +362,7 @@ class MixtureofExpertSVGP(GP, GPInterface):
 
         # Set up the experts and likelihoods
         self.experts: nn.ModuleList = nn.ModuleList([
-            ExpertSVGP(
+            ExpertVSGP(
                 ind_points[k],
                 means[k],
                 covars[k],
@@ -518,7 +518,7 @@ class MixtureofExpertSVGP(GP, GPInterface):
         batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'MixtureofExpertSVGP':
+    ) -> 'MixtureofExpertVSGP':
         """
         Given the traning data and fitting option, fit the model.
 
@@ -693,7 +693,7 @@ class MixtureofExpertSVGP(GP, GPInterface):
 
 
 # CHILD
-class IterativeTrimmingMofEtSVGP(MixtureofExpertSVGP):
+class IterativeTrimmingMofEtVSGP(MixtureofExpertVSGP):
     """
     Implementation of the Mixture of Experts (MoE) using Sparse Variational \
         Gaussian Processes (SVGP) with iterative trimming of the data to \
@@ -724,7 +724,7 @@ class IterativeTrimmingMofEtSVGP(MixtureofExpertSVGP):
         thresh_max: float | None = None,
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'IterativeTrimmingMofEtSVGP':
+    ) -> 'IterativeTrimmingMofEtVSGP':
         """
         Given the traning data and fitting option, fit the model.
 
@@ -794,7 +794,7 @@ class IterativeTrimmingMofEtSVGP(MixtureofExpertSVGP):
 
 
 # MODEL LIST
-class MoESVGPList(IndependentModelList, GPInterface):
+class MoEVSGPList(IndependentModelList, GPInterface):
     """
     Independent list of Mixture of Expert (MoE) using Sparse Variational \
         Gaussian Processes for convienent model fitting/predicting.
@@ -810,7 +810,7 @@ class MoESVGPList(IndependentModelList, GPInterface):
         The list of Mixture of Expert SVGPs.
     """
 
-    def __init__(self, *models: List[MixtureofExpertSVGP]):
+    def __init__(self, *models: List[MixtureofExpertVSGP]):
         super().__init__(*models)
 
     # Properties
@@ -854,7 +854,7 @@ class MoESVGPList(IndependentModelList, GPInterface):
         n_epochs: int = 150,
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'MoESVGPList':
+    ) -> 'MoEVSGPList':
         """
         Given the traning data and fitting option, fit the model.
 
@@ -1004,7 +1004,7 @@ class MoESVGPList(IndependentModelList, GPInterface):
         return scores
 
 
-class ITMoESVGPList(MoESVGPList):
+class ITMoEVSGPList(MoEVSGPList):
     """
     Independent list of Iterative Trimming Mixture of Expert (MoE) using Sparse \
         Variational Gaussian Processes for convienent model fitting/predicting.
@@ -1031,7 +1031,7 @@ class ITMoESVGPList(MoESVGPList):
         thresh_max: float | None = None,
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'ITMoESVGPList':
+    ) -> 'ITMoEVSGPList':
         """
         Given the traning data and fitting option, fit the model.
 
