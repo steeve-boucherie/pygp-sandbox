@@ -728,7 +728,7 @@ class MixtureofExpertVSGP(GP, GPInterface):
 
 
 # CHILD
-class IterativeTrimmingMofEtVSGP(MixtureofExpertVSGP):
+class IterativeTrimmingMoEtVSGP(MixtureofExpertVSGP):
     """
     Implementation of the Mixture of Experts (MoE) using Sparse Variational \
         Gaussian Processes (SVGP) with iterative trimming of the data to \
@@ -755,11 +755,15 @@ class IterativeTrimmingMofEtVSGP(MixtureofExpertVSGP):
         train_y: np.ndarray | Tensor,
         n_iter: int = 5,
         n_epochs: int = 100,
+        batch_size: int = 64,
+        adam_lr: float = 0.01,
+        ngd_lr: float = 0.1,
         thresh_sd: float = 2.62,
         thresh_max: float | None = None,
+        batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
-    ) -> 'IterativeTrimmingMofEtVSGP':
+    ) -> 'IterativeTrimmingMoEtVSGP':
         """
         Given the traning data and fitting option, fit the model.
 
@@ -773,11 +777,21 @@ class IterativeTrimmingMofEtVSGP(MixtureofExpertVSGP):
             The number of training iteration.
         n_epochs: int
             Number of training epoch for each iteration.
+        batch_size: int
+            Batch size to split the training data in mini-batches.
+        adam_lr: float
+            Learning rate for the Adam optimizer.
+        ngd_lr: float
+            Learning rate for the Natural Gradient Descent (NGD) optimizer. \
+            This is only used if self.use_ngd is set to True.
         thresh_sd: float
             The threshold for outlier detection in mulitple of the standard deviation.
         thresh_max: float | None
             (Optional) Max absolute threshold used for capping the standard deviation \
             threshold in high-variance regions.
+        batch_kw: Mapping[str, Any]
+            A mapper of th eofrm param_name -> param_value of optional \
+            settings to pass to the DataLoader for mini-batching.
         optim_kw: Mapping[str, Any]
             A mapper of the form param_name -> param_value of optional \
             settings for the optimizer.
@@ -797,6 +811,10 @@ class IterativeTrimmingMofEtVSGP(MixtureofExpertVSGP):
                 train_x,
                 train_y,
                 n_epochs=n_epochs,
+                batch_size=batch_size,
+                adam_lr=adam_lr,
+                ngd_lr=ngd_lr,
+                batch_kw=batch_kw,
                 optim_kw=optim_kw,
                 verbose=verbose,
             )
@@ -847,6 +865,8 @@ class MoEVSGPList(IndependentModelList, GPInterface):
 
     def __init__(self, *models: List[MixtureofExpertVSGP]):
         super().__init__(*models)
+        # TODO: Add test to check that all model have the same NGD setting
+        self.use_ngd = models[0].use_ngd
 
     # Properties
     @property
@@ -886,7 +906,11 @@ class MoEVSGPList(IndependentModelList, GPInterface):
         self,
         train_inputs: List[np.ndarray | Tensor],
         train_targets: List[np.ndarray | Tensor],
-        n_epochs: int = 150,
+        n_epochs: int = 10,
+        batch_size: int = 256,
+        adam_lr: float = 0.01,
+        ngd_lr: float = 0.1,
+        batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
     ) -> 'MoEVSGPList':
@@ -901,6 +925,13 @@ class MoEVSGPList(IndependentModelList, GPInterface):
             List of tensors of training features.
         n_epochs: int
             Number of training epoch.
+        batch_size: int
+            Batch size to split the training data in mini-batches.
+        adam_lr: float
+            Learning rate for the Adam optimizer.
+        ngd_lr: float
+            Learning rate for the Natural Gradient Descent (NGD) optimizer. \
+            This is only used if self.use_ngd is set to True.
         optim_kw: Mapping[str, Any]
             A mapper of the form param_name -> param_value of optional \
             settings for the optimizer.
@@ -912,9 +943,16 @@ class MoEVSGPList(IndependentModelList, GPInterface):
             MoESVGPList
         """
         # Get defaults
-        def _get_defaults() -> Mapping[str, Any]:
+        def _get_defaults(obj: Literal['batch', 'optim']) -> Mapping[str, Any]:
             """Get default settings"""
-            params = {'lr': .1}
+            params = {
+                'batch': {
+                    'batch_size': batch_size,
+                    'shuffle': True,
+                    'drop_last': True
+                },
+                'optim': {'lr': adam_lr}
+            }[obj]
             return params
 
         # Force input types
@@ -926,10 +964,27 @@ class MoEVSGPList(IndependentModelList, GPInterface):
         self.train()
         self.likelihood.train()
 
-        optimizer = Adam(
-            [{'params': self.parameters()},],
-            **(_get_defaults() | optim_kw)
-        )
+        # Set up the optimizer(s)
+        if self.use_ngd:
+            optimizers = [
+                # Optimizer for variational parameters
+                NGD(
+                    model.variational_parameters(),
+                    num_data=train_y.size(0),
+                    lr=ngd_lr
+                )
+                for model, train_y in length_safe_zip(self.models, train_targets)
+            ]
+            optimizers.append(Adam(
+                self.hyperparameters(),
+                **(_get_defaults('optim') | optim_kw)
+            ))
+
+        else:
+            optimizers = [Adam(
+                self.parameters(),
+                **(_get_defaults('optim') | optim_kw)
+            )]
 
         # Set the objective function
         mll = SumMoEVariationalELBO(
@@ -938,10 +993,18 @@ class MoEVSGPList(IndependentModelList, GPInterface):
             [train_y.size(0) for train_y in train_targets]
         )
 
+        # Create data loader for mini-batching
+        # TODO: Make this compatible with mini-batchin if possible.
+        # data_loader = DataLoader(
+        #     TensorDataset(train_x, train_y),
+        #     **(_get_defaults('batch') | batch_kw)
+        # )
+
         # Start training loop
         for n in range(n_epochs):
             # Zero grad
-            optimizer.zero_grad()
+            for optimizer in optimizers:
+                optimizer.zero_grad()
 
             # Call
             predictions = self(*train_inputs)
@@ -953,27 +1016,15 @@ class MoEVSGPList(IndependentModelList, GPInterface):
 
             # Backward and propr
             loss.backward()
-            optimizer.step()
+            for optimizer in optimizers:
+                optimizer.step()
 
             if n == 0 or (n + 1) % 25 == 0 and verbose:
                 msg = (
                     f'{self.name} - Iter {n + 1} of {n_epochs}: '
                     f'Loss: {loss.item(): .3f}'
                 )
-                # weights = self.get_gates(train_x).mean(dim=1)
-                # msg += ' - '.join([
-                #     f' weight expert #{n:02d} = {round(weights[0].item(), 2)}'
-                #     for n in range(self.n_experts)
-                # ])
-                # msg += '\n'
-                # msg += ' - '.join([
-                #     f' noise expert #{n:02d} = {lkh.noise.item():.3e}'
-                #     for n, lkh in enumerate(self.likelihoods)
-                # ])
                 logger.info(msg)
-
-        # Display score on selected metrics
-        # display_scores(self.score(train_x, train_y))
 
         return self
 
@@ -1062,8 +1113,12 @@ class ITMoEVSGPList(MoEVSGPList):
         train_targets: List[np.ndarray | Tensor],
         n_iter: int = 5,
         n_epochs: int = 100,
+        batch_size: int = 64,
+        adam_lr: float = 0.01,
+        ngd_lr: float = 0.1,
         thresh_sd: float = 2.62,
         thresh_max: float | None = None,
+        batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
     ) -> 'ITMoEVSGPList':
@@ -1078,6 +1133,21 @@ class ITMoEVSGPList(MoEVSGPList):
             List of tensors of training features.
         n_epochs: int
             Number of training epoch.
+        batch_size: int
+            Batch size to split the training data in mini-batches.
+        adam_lr: float
+            Learning rate for the Adam optimizer.
+        ngd_lr: float
+            Learning rate for the Natural Gradient Descent (NGD) optimizer. \
+            This is only used if self.use_ngd is set to True.
+        thresh_sd: float
+            The threshold for outlier detection in mulitple of the standard deviation.
+        thresh_max: float | None
+            (Optional) Max absolute threshold used for capping the standard deviation \
+            threshold in high-variance regions.
+        batch_kw: Mapping[str, Any]
+            A mapper of th eofrm param_name -> param_value of optional \
+            settings to pass to the DataLoader for mini-batching.
         optim_kw: Mapping[str, Any]
             A mapper of the form param_name -> param_value of optional \
             settings for the optimizer.
@@ -1097,6 +1167,10 @@ class ITMoEVSGPList(MoEVSGPList):
                 train_inputs,
                 train_targets,
                 n_epochs=n_epochs,
+                batch_size=batch_size,
+                adam_lr=adam_lr,
+                ngd_lr=ngd_lr,
+                batch_kw=batch_kw,
                 optim_kw=optim_kw,
                 verbose=verbose,
             )
