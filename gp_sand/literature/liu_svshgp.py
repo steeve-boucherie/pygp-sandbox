@@ -950,6 +950,11 @@ class SVSHGP(ApproximateGP, GPInterface):
             Number of training epochs.
         batch_size: int
             Batch size to split the training data in mini-batches.
+        adam_lr: float
+            Learning rate for the Adam optimizer.
+        ngd_lr: float
+            Learning rate for the Natural Gradient Descent (NGD) optimizer. \
+            This is only used if self.use_ngd is set to True.
         batch_kw: Mapping[str, Any]
             A mapper of th eofrm param_name -> param_value of optional \
             settings to pass to the DataLoader for mini-batching.
