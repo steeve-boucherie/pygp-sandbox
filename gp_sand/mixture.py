@@ -12,9 +12,11 @@ from gpytorch.means import Mean
 from gpytorch.mlls import MarginalLogLikelihood
 from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.models import ApproximateGP, GP, IndependentModelList
+from gpytorch.optim import NGD
 from gpytorch.utils.generic import length_safe_zip
 from gpytorch.variational import (
     CholeskyVariationalDistribution,
+    NaturalVariationalDistribution,
     VariationalStrategy
 )
 
@@ -94,17 +96,23 @@ class ExpertVSGP(ApproximateGP):
         ind_points: np.ndarray | Tensor,
         mean_module: Mean,
         covar_module: Kernel,
+        use_ngd: bool = False,
+        jitter_val: float | None = None,
     ):
         """Init class"""
         ind_points = to_tensor(ind_points)
-        var_dist = CholeskyVariationalDistribution(
-            num_inducing_points=ind_points.size(0)
-        )
+        var_dist = [
+            CholeskyVariationalDistribution,
+            NaturalVariationalDistribution,
+        ][use_ngd]
         var_strat = VariationalStrategy(
             self,
             inducing_points=ind_points,
-            variational_distribution=var_dist,
-            learn_inducing_locations=True
+            variational_distribution=var_dist(
+                num_inducing_points=ind_points.size(0)
+            ),
+            learn_inducing_locations=True,
+            jitter_val=jitter_val
         )
         super().__init__(var_strat)
 
@@ -339,6 +347,8 @@ class MixtureofExpertVSGP(GP, GPInterface):
         transition_points: List[float],
         tp_constraints: List[Interval] | None = None,
         sharpness: float = 30.,
+        use_ngd: bool = False,
+        jitter_val: float | None = None,
     ):
         super().__init__()
         self.n_experts = n_experts
@@ -366,10 +376,13 @@ class MixtureofExpertVSGP(GP, GPInterface):
                 ind_points[k],
                 means[k],
                 covars[k],
+                use_ngd=use_ngd,
+                jitter_val=jitter_val,
             )
             for k in range(n_experts)
         ])
         self.likelihood = nn.ModuleList(likelihoods)
+        self.use_ngd = use_ngd
 
         # Gating
         sharpness_constraint = Positive()
@@ -515,6 +528,8 @@ class MixtureofExpertVSGP(GP, GPInterface):
         train_y: np.ndarray | Tensor,
         n_epochs: int = 10,
         batch_size: int = 256,
+        adam_lr: float = 0.01,
+        ngd_lr: float = 0.1,
         batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
@@ -532,6 +547,11 @@ class MixtureofExpertVSGP(GP, GPInterface):
             Number of training epochs.
         batch_size: int
             Batch size to split the training data in mini-batches.
+        adam_lr: float
+            Learning rate for the Adam optimizer.
+        ngd_lr: float
+            Learning rate for the Natural Gradient Descent (NGD) optimizer. \
+            This is only used if self.use_ngd is set to True.
         batch_kw: Mapping[str, Any]
             A mapper of th eofrm param_name -> param_value of optional \
             settings to pass to the DataLoader for mini-batching.
@@ -554,7 +574,7 @@ class MixtureofExpertVSGP(GP, GPInterface):
                     'shuffle': True,
                     'drop_last': True
                 },
-                'optim': {'lr': .1}
+                'optim': {'lr': adam_lr}
             }[obj]
             return params
 
@@ -565,10 +585,23 @@ class MixtureofExpertVSGP(GP, GPInterface):
         self.train()
         self.likelihood.train()
 
-        optimizer = Adam(
-            self.parameters(),
-            **(_get_defaults('optim') | optim_kw)
-        )
+        if self.use_ngd:
+            optimizers = [
+                NGD(
+                    self.variational_parameters(),
+                    num_data=train_y.size(0),
+                    lr=ngd_lr
+                ),
+                Adam(
+                    self.hyperparameters(),
+                    **(_get_defaults('optim') | optim_kw)
+                )
+            ]
+        else:
+            optimizers = [Adam(
+                self.parameters(),
+                **(_get_defaults('optim') | optim_kw)
+            )]
 
         # Set the objective function
         mll = MoEVariationalELBO(self.likelihood, self, num_data=train_y.size(0))
@@ -583,7 +616,8 @@ class MixtureofExpertVSGP(GP, GPInterface):
         for n in range(n_epochs):
             for batch_x, batch_y in data_loader:
                 # Zero grad
-                optimizer.zero_grad()
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
                 # Call
                 pred = self(batch_x)
@@ -592,7 +626,8 @@ class MixtureofExpertVSGP(GP, GPInterface):
 
                 # Backward and propr
                 loss.backward()
-                optimizer.step()
+                for optimizer in optimizers:
+                    optimizer.step()
 
             # if n == 0 or (n + 1) % 25 == 0 and verbose:
             if verbose:

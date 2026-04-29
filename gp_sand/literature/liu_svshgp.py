@@ -29,8 +29,11 @@ from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.means import ConstantMean, Mean, ZeroMean
 from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.models import ApproximateGP
+from gpytorch.optim import NGD
 from gpytorch.variational import (
     CholeskyVariationalDistribution,
+    NaturalVariationalDistribution,
+    # TrilNaturalVariationalDistribution,
     VariationalStrategy
 )
 
@@ -148,6 +151,11 @@ class NoiseGP(ApproximateGP):
     covar_module : Kernel
         Kernel (covariance) function for g(x). Defines the smoothness and structure \
         of noise variations. Common choice: ScaleKernel(RBFKernel(ard_num_dims=d)).
+
+    use_ngd: bool, default=False
+        An option for whether to use the natural gradient descent (NGD) during training \
+        of the variational distribution parameters. This can speed-up convergence \
+        significantly but cause numerical instabilities. Use with caution.
 
     jitter_val : float or None, default=None
         Jitter value added to the diagonal of kernel matrices for numerical stability. \
@@ -296,16 +304,20 @@ class NoiseGP(ApproximateGP):
         ind_points: Tensor,
         mean_module: Mean,
         covar_module: Kernel,
+        use_ngd: bool = False,
         jitter_val: float | None = None,
     ):
         """Init class."""
-        var_dist = CholeskyVariationalDistribution(
-            num_inducing_points=ind_points.size(0),
-        )
+        var_dist = [
+            CholeskyVariationalDistribution,
+            NaturalVariationalDistribution,
+        ][use_ngd]
         var_strat = VariationalStrategy(
             self,
             inducing_points=ind_points,
-            variational_distribution=var_dist,
+            variational_distribution=var_dist(
+                num_inducing_points=ind_points.size(0)
+            ),
             learn_inducing_locations=True,
             jitter_val=jitter_val
         )
@@ -747,6 +759,11 @@ class SVSHGP(ApproximateGP, GPInterface):
         Kernel function for the log-noise GP g(x). If None, uses ScaleKernel(RBFKernel) \
         with ARD. Can differ from covar_f to capture different length scales.
 
+    use_ngd: bool, default=False
+        An option for whether to use the natural gradient descent (NGD) during training \
+        of the variational distribution parameters. This can speed-up convergence \
+        significantly but cause numerical instabilities. Use with caution.
+
     jitter_val : float or None, default=None
         Jitter value added to diagonal of covariance matrices for numerical stability. \
         If None, uses GPyTorch's default jitter.
@@ -847,18 +864,22 @@ class SVSHGP(ApproximateGP, GPInterface):
         covar_f: Kernel | None = None,
         mean_g: Mean = ConstantMean(),
         covar_g: Kernel | None = None,
+        use_ngd: bool = False,
         jitter_val: float | None = None,
     ):
         """Init class."""
         # Set up the latent f GP
-        ind_points_f = to_tensor(ind_points_f)
-        var_dist = CholeskyVariationalDistribution(
-            num_inducing_points=ind_points_f.size(0)
-        )
+        var_dist = [
+            CholeskyVariationalDistribution,
+            NaturalVariationalDistribution,
+        ][use_ngd]
+        self.use_ngd = use_ngd  # Store for setup during training.
         var_strat = VariationalStrategy(
             self,
             inducing_points=ind_points_f,
-            variational_distribution=var_dist,
+            variational_distribution=var_dist(
+                num_inducing_points=ind_points_f.size(0)
+            ),
             learn_inducing_locations=True,
             jitter_val=jitter_val
         )
@@ -880,6 +901,7 @@ class SVSHGP(ApproximateGP, GPInterface):
                 covar_g,
                 default_kernel(ind_points_g.size(1))
             ][covar_g is None],
+            use_ngd=use_ngd,
             jitter_val=jitter_val
         )
 
@@ -909,6 +931,8 @@ class SVSHGP(ApproximateGP, GPInterface):
         train_y: np.ndarray | Tensor,
         n_epochs: int = 5,
         batch_size: int = 64,
+        adam_lr: float = 0.01,
+        ngd_lr: float = 0.1,
         batch_kw: Mapping[str, Any] = {},
         optim_kw: Mapping[str, Any] = {},
         verbose: bool = True,
@@ -948,7 +972,7 @@ class SVSHGP(ApproximateGP, GPInterface):
                     'shuffle': True,
                     'drop_last': True
                 },
-                'optim': {'lr': .1}
+                'optim': {'lr': adam_lr}
             }[obj]
             return params
 
@@ -958,13 +982,28 @@ class SVSHGP(ApproximateGP, GPInterface):
         # Set training mode
         self.train()
         self.noise_gp.train()
-        # self.likelihood.train()
 
-        # Setup optimizer
-        optimizer = Adam(
-            self.parameters(),
-            **(_get_defaults('optim') | optim_kw)
-        )
+        # Set up the optimizer(s)
+        if self.use_ngd:
+            optimizers = [
+                # Optimizer for variational parameters
+                NGD(
+                    self.variational_parameters(),
+                    num_data=train_y.size(0),
+                    lr=ngd_lr
+                ),
+                # Optimizer for the remainder
+                Adam(
+                    self.hyperparameters(),
+                    **(_get_defaults('optim') | optim_kw)
+                )
+            ]
+
+        else:
+            optimizers = [Adam(
+                self.parameters(),
+                **(_get_defaults('optim') | optim_kw)
+            )]
 
         # Set the objective function
         mll = SVSHGPVariationalELBO(self, num_data=train_y.size(0))
@@ -977,18 +1016,20 @@ class SVSHGP(ApproximateGP, GPInterface):
 
         # Start training loop
         for n in range(n_epochs):
+            # var_optim.
             for batch_x, batch_y in data_loader:
                 # Zero grad
-                optimizer.zero_grad()
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
                 # Call
                 pred = self(batch_x)
-                # self.update_loss_terms(train_x)
                 loss = - mll(pred, batch_y, x=batch_x)
 
                 # Backward and propr
                 loss.backward()
-                optimizer.step()
+                for optimizer in optimizers:
+                    optimizer.step()
 
             # if n == 0 or (n + 1) % 25 == 0 and verbose:
             if verbose:
