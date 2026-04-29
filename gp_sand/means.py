@@ -589,7 +589,7 @@ class PiecewiseLinearMean(Mean, MeanInterface):
             x = x.squeeze(-1)
 
         # Sigmoid gate 01: 1 for low speeds, 0 for medium to high speeds
-        gate_0 = torch.sigmoid(self.sharpness * (x - self.x_01))
+        gate_0 = 1 - torch.sigmoid(self.sharpness * (x - self.x_01))
 
         # Sigmoid gate 12: 1 for high speeds, 0 for low to medium speeds
         gate_1 = torch.sigmoid(self.sharpness * (x - self.x_12))
