@@ -1,24 +1,64 @@
 """Customized mean modules for GPs regression."""
 import logging
-from typing import Any
+from typing import Any, Mapping
 
 from gpytorch.distributions import MultivariateNormal
-from gpytorch.likelihoods import _GaussianLikelihoodBase, GaussianLikelihood
+from gpytorch.likelihoods import (
+    _GaussianLikelihoodBase,
+    _OneDimensionalLikelihood,
+    GaussianLikelihood,
+)
 from gpytorch.likelihoods.noise_models import HeteroskedasticNoise
 
-# from torch import Tensor
+import torch
+from torch import Tensor
 # from torch.distributions import Normal
 
 
 # PACKAGE IMPORTS
-# Nothin'
+from gp_sand.distributions import GumbelDistribution
 
 
 # LOGGER
 logger = logging.getLogger(__name__)
 
 
-# CUSTOME LIKELIHOOD
+# HOMOSCEDASTIC NOISE
+class GumbelLikelihood(_OneDimensionalLikelihood):
+    def __init__(self):
+        super().__init__()
+        # Learnable log-scale (ensures scale > 0)
+        self.raw_scale = torch.nn.Parameter(torch.zeros(1))
+
+    @property
+    def scale(self) -> Tensor:
+        return torch.nn.functional.softplus(self.raw_scale)
+
+    def forward(
+        self,
+        f: MultivariateNormal,
+        **kwargs: Mapping[str, Any]
+    ) -> GumbelDistribution:
+        return GumbelDistribution(loc=f, scale=self.scale)
+
+    def marginal(
+        self,
+        function_dist: MultivariateNormal,
+        *params: Any,
+        **kwargs: Mapping[str, Any]
+    ) -> GumbelDistribution:
+        return GumbelDistribution(function_dist.mean, self.scale)
+
+    def expected_log_prob(
+        self,
+        y: Tensor,
+        f: MultivariateNormal,
+        **kwargs: Mapping[str, Any]
+    ) -> Tensor:
+        return super().expected_log_prob(y, f, **kwargs)
+
+
+# CUSTOM LIKELIHOOD
 class HeteroskedasticGaussianLikelihood(_GaussianLikelihoodBase):
     """
     Gaussian Likelihood model handling heteroskedastic noise.

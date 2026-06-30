@@ -20,16 +20,20 @@ arXiv:1811.01179v3
 
 TODO: Finish description.
 """
+import abc
 import logging
+import math
+import warnings
 from typing import Any, Callable, List, Literal, Mapping, Tuple
 
 from gpytorch.distributions import MultivariateNormal
 from gpytorch.kernels import Kernel, RBFKernel, ScaleKernel
-from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.likelihoods import Likelihood
 from gpytorch.means import ConstantMean, Mean, ZeroMean
 from gpytorch.mlls._approximate_mll import _ApproximateMarginalLogLikelihood
 from gpytorch.models import ApproximateGP
 from gpytorch.optim import NGD
+from gpytorch.utils.quadrature import GaussHermiteQuadrature1D
 from gpytorch.variational import (
     CholeskyVariationalDistribution,
     NaturalVariationalDistribution,
@@ -45,13 +49,14 @@ import pandas as pd
 
 import torch
 from torch import Tensor
-from torch.distributions import Normal
+from torch.distributions import Distribution, Normal
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 
 # PACKAGE IMPORTS
 # from gp_sand.means import MeanInterface
+from gp_sand.distributions import GumbelDistribution
 from gp_sand.metrics import compute_scores, display_scores
 from gp_sand.models import GPInterface, SCORES
 from gp_sand.utils import (to_numpy, to_tensor)
@@ -76,6 +81,300 @@ def default_kernel(d: int) -> Kernel:
         Kernel
     """
     return ScaleKernel(RBFKernel(ard_num_dims=d))
+
+
+# 2D GHQ
+class GaussHermiteQuadrature2D(GaussHermiteQuadrature1D):
+    """
+    An implementation of the Gauss-Hermite Quadrature to compute \
+    2D dimensional integral, as requested by the ELBO of SVSHGP.
+
+    Notes
+    -----
+    This class inheterits from the 1-D version in GPyTorch for simplicity.
+
+    Attributes
+    ----------
+    num_locs: int
+        Number of location points used for approximating the integral.
+    """
+    def __init__(self, num_locs: int = 20):
+        super().__init__(num_locs)
+
+    def forward(
+        self,
+        func: Callable[[Tensor], Tensor],
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal
+    ) -> Tensor:
+        """
+        Given the distrubution samples, compute the 2D GHQ integral.
+
+        Parameters
+        ----------
+        func: Callable[[Tensor, Tensor], Tensor]
+            A callable computing the likelihood form the grid of distribution \
+            parameters.
+        dist_f: MultivariateNormal
+            Samples from the latent function of the SVSGP.
+        dist_g: MultivariateNormal
+            Sample from the latent funnoisection of the SVSGP.
+        """
+        # Get the distribution moments
+        mean_f, std_f = dist_f.mean, dist_f.stddev
+        mean_g, std_g = dist_g.mean, dist_g.stddev
+        nq = self.num_locs
+
+        # Get the locs and weigths
+        locs = self.locations.to(mean_f.dtype)
+        weights = self.weights.to(mean_f.dtype)
+
+        # Reshape to create the grid of distribution parameters.
+        locs = locs.view(nq, *([1] * mean_f.dim()))
+        f_nodes = mean_f.unsqueeze(0) + math.sqrt(2) * std_f.unsqueeze(0) * locs
+        g_nodes = mean_g.unsqueeze(0) + math.sqrt(2) * std_g.unsqueeze(0) * locs
+
+        f_grid = f_nodes.unsqueeze(1)   # (Nq, 1, *batch)
+        g_grid = g_nodes.unsqueeze(0)   # (1, Nq, *batch)
+
+        h_vals = func(f_grid, g_grid)   # (Nq, Nq, *batch)
+
+        w_grid = (weights.view(nq, 1) * weights.view(1, nq)).view(nq, nq, *([1] * mean_f.dim()))
+        return (w_grid * h_vals).sum(dim=(0, 1)) / math.pi
+
+
+# LIKELIHOODS
+class HeteroskedasticLikelihood(Likelihood, abc.ABC):
+    """Abstract class for heteroskedastic likelihood models."""
+
+    def __init__(self):
+        super().__init__()
+
+    # Methods
+    @abc.abstractmethod
+    def forward(self, f: Tensor, g: Tensor, *args: Any, **kwargs: Any) -> Distribution:
+        """
+        Return a torch.distributions object for p(y | f, g).
+
+        Parameters
+        ----------
+        f: Tensor
+            Tensor of estimated mean of the latent function.
+        g: Tensor
+            Tensor of estimated mean of the latent noise.
+        """
+        raise NotImplementedError('This is an abstract class!')
+
+    @abc.abstractmethod
+    def expected_log_prob(
+        self,
+        observations: Tensor,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tensor:
+        """
+        Given the approximate distributions, compute the expected log-probability\
+        of the observed data.
+
+        Parameters
+        ----------
+        target: Tensor
+            Values of observed data..
+        dist_f: MultivariateNormal
+            Estimate latent function.
+        dist_g: MultivariateNormal
+            Estimate latent noise.
+
+        Returns
+        -------
+            Tensor
+        """
+        raise NotImplementedError('This is an abstract class!')
+
+    @abc.abstractmethod
+    def marginal(
+        self,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any
+    ) -> Distribution:
+        """
+        Given the approximate distributions, compute marginal \
+        distribution by adding the noise.
+
+        Parameters
+        ----------
+        dist_f: MultivariateNormal
+            Estimate latent function.
+        dist_g: MultivariateNormal
+            Estimate latent noise.
+
+        Returns
+        -------
+            Tensor
+        """
+        raise NotImplementedError('This is an abstract class!')
+
+
+class _TwoDimensionalLikelihood(HeteroskedasticLikelihood):
+    """
+    Abstract class for likelihoods p(y | f, g) driven by two conditionally-
+    independent latent GPs (e.g. f -> location, g -> scale), leverage \
+    2-dimensional Gauss-Hermite Quadrature to approximate the integral.
+
+    Parameters
+    ----------
+    num_locs: int
+        Number of location points used for approximating the integral. \
+        Default is 20.
+    """
+
+    def __init__(
+        self,
+        num_locs: int = 20,
+    ):
+        super().__init__()
+        self.quadrature = GaussHermiteQuadrature2D(num_locs)
+
+    # Methods
+    def expected_log_prob(
+        self,
+        observations: Tensor,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tensor:
+        """
+        Given the approximate distributions, compute the expected log-probability\
+        of the observed data.
+
+        Parameters
+        ----------
+        target: Tensor
+            Values of observed data..
+        dist_f: MultivariateNormal
+            Estimate latent function.
+        dist_g: MultivariateNormal
+            Estimate latent noise.
+
+        Returns
+        -------
+            Tensor
+        """
+        def log_prob_func(f, g):
+            dist: Distribution = self.forward(f, g, *args, **kwargs)
+            return dist.log_prob(observations)
+        return self.quadrature(log_prob_func, dist_f, dist_g)
+
+
+class HeteroskedasticGaussianLikelihood(HeteroskedasticLikelihood):
+    """
+    Implementation of heteroskedastic likelihoodfor normally-distributed \
+    observation noise that can be written in closed form.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    # Methods
+    def forward(self, f: Tensor, g: Tensor, *args: Any, **kwargs: Any) -> GumbelDistribution:
+        raise NotImplementedError('This is not needed for the Heteroskedastic Gaussian')
+
+    def expected_log_prob(
+        self,
+        observations: Tensor,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tensor:
+        """
+        Given the approximate distributions, compute the expected log-probability\
+        of the observed data.
+
+        Parameters
+        ----------
+        target: Tensor
+            Values of observed data..
+        dist_f: MultivariateNormal
+            Estimate latent function.
+        dist_g: MultivariateNormal
+            Estimate latent noise.
+
+        Returns
+        -------
+            Tensor
+        """
+        # NOTE: The sum is handled by the ELBO class
+        # Get the noise-GP predictions
+        rg = torch.exp(dist_g.mean - 0.5 * dist_g.variance)
+
+        # Term : main likelihood (residuals)
+        llk = Normal(dist_f.mean, rg.sqrt()).log_prob(observations)  # .sum()
+
+        # Term 2: trace of G
+        trace_g = 0.25 * dist_g.variance  # .sum()
+
+        # Term 3: trace of F scaled with the Rg posterior
+        trace_f = 0.5 * (dist_f.variance / rg)  # .sum()
+
+        return llk - trace_g - trace_f
+
+    def marginal(
+        self,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any,
+    ) -> GumbelDistribution:
+        mean_f, covar_f = dist_f.mean, dist_f.lazy_covariance_matrix
+        mean_g, var_g = dist_g.mean, dist_g.variance
+        noise_covar = DiagLinearOperator(torch.exp(mean_g + .5 * var_g))
+
+        return MultivariateNormal(mean_f, covar_f + noise_covar)
+
+
+class HeteroskedasticGumbelLikelihood(_TwoDimensionalLikelihood):
+    """
+    Implementation of heteroskedastic likelihood for Gumbel-distributed \
+    observation noise.
+
+    Parameters
+    ----------
+    num_locs: int
+        Number of location points used for approximating the integral. \
+        Default is 20.
+    beta_link: Callable[[Tensor], Tensor]
+        A function to transform the unconstrained GP estimates into to \
+        the value space of the scale parameter, beta, that must be positive.
+        Default is the softplus method.
+    """
+    def __init__(
+        self,
+        beta_link: Callable[[Tensor], Tensor] = torch.nn.functional.softplus,
+        # beta_link: Callable[[Tensor], Tensor] = torch.exp,
+        num_locs: int = 20
+    ):
+        super().__init__(num_locs=num_locs)
+        self.beta_link = beta_link
+
+    def forward(self, f: Tensor, g: Tensor, *args: Any, **kwargs: Any) -> GumbelDistribution:
+        return GumbelDistribution(loc=f, scale=self.beta_link(g), **kwargs)
+
+    def marginal(
+        self,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
+        *args: Any,
+        **kwargs: Any,
+    ) -> GumbelDistribution:
+        loc = dist_f.mean
+        scale = self.beta_link(dist_g.mean)
+        return GumbelDistribution(loc, scale)
 
 
 # NOISE GP
@@ -360,6 +659,13 @@ class NoiseGP(ApproximateGP):
         -------
             DiagLinearOperator
         """
+        # DEPRECATE: Remove this class
+        msg = 'This method is deprecated and will be remove. Use the specific ' \
+              'class "HeteroskedasticGaussianLikelihood" to handle heteroskedastic' \
+              'noise.'
+        logger.warning(msg)
+        warnings.warn(msg, DeprecationWarning, 2)
+
         dist_g = self(x)
         mu_g = dist_g.mean
         var_g = dist_g.variance  # Directly gives sigma**2
@@ -437,6 +743,9 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 
     Parameters
     ----------
+    likelihood: _TwoDimensionalLikelihood
+        The likelihood model for the data. It must be a subclass of `_TwoDimensionalLikelihood`
+        and implement the `forward` method called in `expected_log_prob`.
     model : SVSHGP
         The SVSHGP model instance containing both the latent GP (f) and \
         noise GP (g) with their variational strategies.
@@ -463,11 +772,11 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 
     Methods
     -------
-    _log_likelihood_term(approximate_dist_f, targets, **kwargs)
+    _log_likelihood_term(dist_f, targets, **kwargs)
         Computes the expected log-likelihood term with variance corrections. \
         Requires kwargs['x'] containing the input features for evaluating g(x).
 
-    forward(approximate_dist_f, targets, **kwargs)
+    forward(dist_f, targets, **kwargs)
         Computes the complete ELBO (or its components if combine_terms=False). \
         This is the main objective function maximized during training.
 
@@ -555,6 +864,7 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 
     def __init__(
         self,
+        likelihood: HeteroskedasticLikelihood,
         model: 'SVSHGP',
         num_data: int,
         beta: float = 1.,
@@ -562,11 +872,12 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
     ):
         # NOTE: Use a dummy gaussian likelihood for super().__init__
         # This is ignored as the LL term is computed manually.
-        super().__init__(GaussianLikelihood(), model, num_data, beta, combine_terms)
+        super().__init__(likelihood, model, num_data, beta, combine_terms)
 
     def _log_likelihood_term(
         self,
-        approximate_dist_f: MultivariateNormal,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
         targets: Tensor,
         **kwargs
     ) -> Tensor:
@@ -575,32 +886,28 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 
         Attributes
         ----------
-        approximate_dist_f: MultiVariateNormal
-            Estimated MVN.
+        dist_f: MultivariateNormal
+            Estimated latent function.
+        dist_g: MultivariateNormal
+            Estimated latent noise.
         target: Tensor
             Training target values.
         kwargs: Mapping[str, Any]
             Optional argument it must constain the tensor of training features \
             to estimate the diagonal term.
-        """
-        # Get the noise-GP predictions
-        g_dist: MultivariateNormal = self.model.noise_gp(kwargs['x'])
-        rg = torch.exp(g_dist.mean - 0.5 * g_dist.variance)
-
-        # Term : main likelihood (residuals)
-        llk = Normal(approximate_dist_f.mean, rg.sqrt()).log_prob(targets).sum()
-
-        # Term 2: trace of G
-        trace_g = 0.25 * g_dist.variance.sum()
-
-        # Term 3: trace of F scaled with the Rg posterior
-        trace_f = 0.5 * (approximate_dist_f.variance / rg).sum()
-
-        return llk - trace_g - trace_f
+        # """
+        llk = self.likelihood.expected_log_prob(
+            targets,
+            dist_f,
+            dist_g,
+            **kwargs
+        )
+        return llk.sum(-1)
 
     def forward(
         self,
-        approximate_dist_f: MultivariateNormal,
+        dist_f: MultivariateNormal,
+        dist_g: MultivariateNormal,
         targets: Tensor,
         **kwargs: Mapping[str, Any]
     ) -> Tensor:
@@ -616,8 +923,10 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
 
         Parameters
         ----------
-        approximate_dist_f: MultivariateNormal
+        dist_f: MultivariateNormal
             Estimate latent function.
+        dist_g: MultivariateNormal
+            Estimate latent noise.
         target: Tensor
             Training targets.
         **kwargs: Mapping[str, Any]
@@ -628,10 +937,11 @@ class SVSHGPVariationalELBO(_ApproximateMarginalLogLikelihood):
             Tensor
         """
         # Get likelihood term and KL term
-        num_batch = approximate_dist_f.event_shape[0]
+        num_batch = dist_f.event_shape[0]
         log_likelihood = (
             self._log_likelihood_term(
-                approximate_dist_f,
+                dist_f,
+                dist_g,
                 targets,
                 **kwargs
             )
@@ -864,6 +1174,7 @@ class SVSHGP(ApproximateGP, GPInterface):
         covar_f: Kernel | None = None,
         mean_g: Mean = ConstantMean(),
         covar_g: Kernel | None = None,
+        likelihood: HeteroskedasticLikelihood = HeteroskedasticGaussianLikelihood(),
         use_ngd: bool = False,
         jitter_val: float | None = None,
     ):
@@ -904,6 +1215,8 @@ class SVSHGP(ApproximateGP, GPInterface):
             use_ngd=use_ngd,
             jitter_val=jitter_val
         )
+
+        self.likelihood = likelihood
 
     # Forward
     def forward(self, x: Tensor) -> MultivariateNormal:
@@ -1011,7 +1324,7 @@ class SVSHGP(ApproximateGP, GPInterface):
             )]
 
         # Set the objective function
-        mll = SVSHGPVariationalELBO(self, num_data=train_y.size(0))
+        mll = SVSHGPVariationalELBO(self.likelihood, self, num_data=train_y.size(0))
 
         # Create data loader for mini-batching
         data_loader = DataLoader(
@@ -1028,8 +1341,9 @@ class SVSHGP(ApproximateGP, GPInterface):
                     optimizer.zero_grad()
 
                 # Call
-                pred = self(batch_x)
-                loss = - mll(pred, batch_y, x=batch_x)
+                pred_f = self(batch_x)
+                pred_g = self.noise_gp(batch_x)
+                loss = - mll(pred_f, pred_g, batch_y)
 
                 # Backward and propr
                 loss.backward()
@@ -1114,17 +1428,19 @@ class SVSHGP(ApproximateGP, GPInterface):
         self.noise_gp.eval()
 
         with torch.no_grad():
-            f_dist = self(test_x)
-            mean, covar = f_dist.mean, f_dist.lazy_covariance_matrix
-            noise_covar = self.noise_gp.added_noise(test_x)
-            y_obs = MultivariateNormal(mean, covar + noise_covar)
+            pred_f = self(test_x)
+            pred_g = self.noise_gp(test_x)
+            # mean, covar = f_dist.mean, f_dist.lazy_covariance_matrix
+            # noise_covar = self.noise_gp.added_noise(test_x)
+            # y_obs = MultivariateNormal(mean, covar + noise_covar)
+            y_obs = self.likelihood(pred_f, pred_g)
 
             lower, upper = y_obs.confidence_region()
 
         if return_ci:
-            return f_dist, lower, upper
+            return pred_f, lower, upper
 
-        return f_dist
+        return pred_f
 
     def score(
         self,

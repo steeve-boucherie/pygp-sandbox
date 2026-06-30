@@ -1,6 +1,7 @@
 """Customized mean modules for GPs regression."""
 import abc
 import logging
+import math
 from typing import Any, Mapping
 
 from gpytorch.constraints import Interval, Positive
@@ -366,6 +367,334 @@ class LogisticMean(Mean, MeanInterface):
         self,
         test_x: np.ndarray | Tensor,
         return_ci: bool = True,
+    ) -> Tensor:
+        """
+        Given the test feautres, make preduction and return the posterior \
+            distribution alongside with confidence interval.
+
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input features.
+        return_ci: bool
+            An option for whether to return the confidence interval.
+
+        Returns
+        -------
+            MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]
+        """
+        # Force input types
+        test_x = to_tensor(test_x)
+
+        # Set to eval
+        self.eval()
+
+        with torch.no_grad():
+            pred = self(test_x)
+
+        return pred
+
+
+class LogitMean(Mean, MeanInterface):
+    """
+    Parametric mean function to use in GP,
+        approximating it as an logit function.
+
+    The logit function is defined for x in [0, 1] as follows:
+
+    >>> logit(x) = a_1 * log(x / (1 - x)) + b_0
+
+    Where a_1, and b_0 are learnable parameters of the model.
+
+    Constraints:
+    - A positive constraint is imposed on the slope parameter `a_1`.
+
+    Attributes
+    ----------
+    a_1_raw: Parameter | None
+        Initial value for the raw slope parameter, `a_1`.
+    b_0: Parameter | None
+        Initial value for the offset parameter, `b_0`.
+    """
+    _A_1_RAW = nn.Parameter(torch.tensor(0.))
+    _B_0 = nn.Parameter(torch.tensor(0.))
+
+    def __init__(
+        self,
+        a_1_raw: nn.Parameter | None = None,
+        b_0: nn.Parameter | None = None,
+    ):
+        super().__init__()
+        self.a_1_raw = [a_1_raw, self._A_1_RAW][a_1_raw is None]
+        self.b_0 = [b_0, self._B_0][b_0 is None]
+
+    # Properties
+    @property
+    def a_1(self) -> nn.Parameter:
+        """Return the constrained value of the slope parameter, `a_1`."""
+        return torch.exp(self.a_1_raw)
+
+    # Forward
+    def forward(self, x: Tensor):
+        """
+        Given the wind speed, compute the power.
+
+        Parameters
+        ----------
+        x: tensor, shape (n,)
+            wind speed values, shape (n,) or (n, 1)
+
+        Returns
+        -------
+            tensor, shape (n,)
+        """
+        x = x.clip(1e-6, 1 - 1e-6)  # Avoid infinities
+        y = self.a_1 * torch.logit(x) + self.b_0
+        return y.squeeze()
+
+    # Fit/Predict
+    def fit(
+        self,
+        train_x: np.ndarray | Tensor,
+        train_y: np.ndarray | Tensor,
+        n_epochs: int = 250,
+        optim_kw: Mapping[str, Any] = {},
+        verbose: bool = True,
+    ) -> 'LogitMean':
+        """
+        Given the traning data and fitting option, fit the model.
+
+        Parameters
+        ----------
+        train_x: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training features.
+        train_y: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training targets
+        n_epochs: int
+            Number of training epoch.
+        optim_kw: Mapping[str, Any]
+            A mapper of the form param_name -> param_value of optional \
+            settings for the optimizer.
+        verbose: bool
+            An option for whether to print taining status in logger.
+
+        Returns
+        -------
+            LogitMean
+        """
+        # Get defaults
+        def _get_defaults() -> Mapping[str, Any]:
+            """Get default settings"""
+            params = {'lr': .1}
+            return params
+
+        # Force input types
+        train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
+
+        # Set training mode
+        self.train()
+
+        # Setup optimizer
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Set the objective function
+        obj = nn.MSELoss()
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Start training loop
+        for n in range(n_epochs):
+            # Zero grad
+            optimizer.zero_grad()
+
+            # Call
+            pred = self(train_x)
+            loss = obj(pred, train_y)
+
+            # Backward and propr
+            loss.backward()
+            optimizer.step()
+
+            if (n == 0 or (n + 1) % 25 == 0) and verbose:
+                logger.info(
+                    f'Iter {n + 1} of {n_epochs}: '
+                    f'Loss: {obj.item(): .3f}'
+                )
+
+        return self
+
+    def predict(
+        self,
+        test_x: np.ndarray | Tensor,
+    ) -> Tensor:
+        """
+        Given the test feautres, make preduction and return the posterior \
+            distribution alongside with confidence interval.
+
+        Parameters
+        ----------
+        test_x: np.ndarray | Tensor
+            Input features.
+        return_ci: bool
+            An option for whether to return the confidence interval.
+
+        Returns
+        -------
+            MultivariateNormal | Tuple[MultivariateNormal, Tensor, Tensor]
+        """
+        # Force input types
+        test_x = to_tensor(test_x)
+
+        # Set to eval
+        self.eval()
+
+        with torch.no_grad():
+            pred = self(test_x)
+
+        return pred
+
+
+class InvSineMean(Mean, MeanInterface):
+    """
+    Parametric mean function to use in GP,
+        approximating it as an inverse of the sine function.
+
+    The inverse sine function is defined for x in [0, 1] as follows:
+
+    >>> logit(x) = a_1 / sine(pi * x) + b_0
+
+    Where a_1, and b_0 are learnable parameters of the model.
+
+    Constraints:
+    - A positive constraint is imposed on the slope parameter `a_1`.
+
+    Attributes
+    ----------
+    a_1_raw: Parameter | None
+        Initial value for the raw slope parameter, `a_1`.
+    b_0: Parameter | None
+        Initial value for the offset parameter, `b_0`.
+    """
+    _A_1_RAW = nn.Parameter(torch.tensor(0.))
+    _B_0 = nn.Parameter(torch.tensor(0.))
+
+    def __init__(
+        self,
+        a_1_raw: nn.Parameter | None = None,
+        b_0: nn.Parameter | None = None,
+    ):
+        super().__init__()
+        self.a_1_raw = [a_1_raw, self._A_1_RAW][a_1_raw is None]
+        self.b_0 = [b_0, self._B_0][b_0 is None]
+
+    # Properties
+    @property
+    def a_1(self) -> nn.Parameter:
+        """Return the constrained value of the slope parameter, `a_1`."""
+        return torch.exp(self.a_1_raw)
+
+    # Forward
+    def forward(self, x: Tensor):
+        """
+        Given the wind speed, compute the power.
+
+        Parameters
+        ----------
+        x: tensor, shape (n,)
+            wind speed values, shape (n,) or (n, 1)
+
+        Returns
+        -------
+            tensor, shape (n,)
+        """
+        x = x.clip(1e-6, 1 - 1e-6)  # Avoid infinities
+        y = self.a_1 / torch.sin(math.pi * x) + self.b_0
+        return y.squeeze()
+
+    # Fit/Predict
+    def fit(
+        self,
+        train_x: np.ndarray | Tensor,
+        train_y: np.ndarray | Tensor,
+        n_epochs: int = 250,
+        optim_kw: Mapping[str, Any] = {},
+        verbose: bool = True,
+    ) -> 'LogitMean':
+        """
+        Given the traning data and fitting option, fit the model.
+
+        Parameters
+        ----------
+        train_x: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training features.
+        train_y: np.ndarray | torch.Tensor, shape (n, m)
+            Tensor of training targets
+        n_epochs: int
+            Number of training epoch.
+        optim_kw: Mapping[str, Any]
+            A mapper of the form param_name -> param_value of optional \
+            settings for the optimizer.
+        verbose: bool
+            An option for whether to print taining status in logger.
+
+        Returns
+        -------
+            LogitMean
+        """
+        # Get defaults
+        def _get_defaults() -> Mapping[str, Any]:
+            """Get default settings"""
+            params = {'lr': .1}
+            return params
+
+        # Force input types
+        train_x, train_y = [to_tensor(t) for t in [train_x, train_y]]
+
+        # Set training mode
+        self.train()
+
+        # Setup optimizer
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Set the objective function
+        obj = nn.MSELoss()
+        optimizer = Adam(
+            self.parameters(),
+            **(_get_defaults() | optim_kw)
+        )
+
+        # Start training loop
+        for n in range(n_epochs):
+            # Zero grad
+            optimizer.zero_grad()
+
+            # Call
+            pred = self(train_x)
+            loss = obj(pred, train_y)
+
+            # Backward and propr
+            loss.backward()
+            optimizer.step()
+
+            if (n == 0 or (n + 1) % 25 == 0) and verbose:
+                logger.info(
+                    f'Iter {n + 1} of {n_epochs}: '
+                    f'Loss: {obj.item(): .3f}'
+                )
+
+        return self
+
+    def predict(
+        self,
+        test_x: np.ndarray | Tensor,
     ) -> Tensor:
         """
         Given the test feautres, make preduction and return the posterior \
